@@ -4,14 +4,14 @@
 # Wael Isa
 # Website:  https://www.wael.name
 # GitHub:   https://github.com/waelisa/home-backup
-# Version:  v1.1.2
+# Version:  v1.1.3
 # Build Date: 02/24/2026
 #
 # ██╗    ██╗ █████╗ ███████╗██╗         ██╗███████╗ █████╗
 # ██║    ██║██╔══██╗██╔════╝██║         ██║██╔════╝██╔══██╗
 # ██║ █╗ ██║███████║█████╗  ██║         ██║███████╗███████║
 # ██║███╗██║██╔══██║██╔══╝  ██║         ██║╚════██║██╔══██║
-# ╚███╔███╔╝██║  ██║███████╗███████╗    ██║███████║██║  ██║
+# ╚███╔███╔╝██║  ██║███████╗███████╗    ██║███████╗██║  ██║
 # ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝    ╚═╝╚══════╝╚═╝  ╚═╝
 #
 # Description: A bulletproof backup tool for your home folder with smart exclusions,
@@ -38,6 +38,9 @@
 #   • Desktop shortcut integration
 #   • Comprehensive logging with viewer
 #   • CLI arguments for all operations
+#   • Color-coded log summaries
+#   • Paginated help system
+#   • Remote sync ready (SSH support coming in v2.0)
 #
 # Performance Modes:
 #   • safe   - Default, uses --no-inplace, verifies with checksums (safest)
@@ -73,12 +76,13 @@
 #   v1.1.0 - Universal path detection & USB support
 #   v1.1.1 - Performance tuning, encryption, verification
 #   v1.1.2 - Auto-eject for USB drives, integrity verification
+#   v1.1.3 - Comprehensive help system, color-coded logs, pagination
 #
 #############################################################################################################################
 
 # Script configuration
 SCRIPT_NAME="Home Folder Backup Utility"
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.3"
 SCRIPT_DESCRIPTION="A bulletproof backup tool for your home folder with smart exclusions"
 SCRIPT_AUTHOR="Wael Isa"
 SCRIPT_WEBSITE="https://www.wael.name"
@@ -113,6 +117,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 NC='\033[0m'
 
 # Load custom configuration if exists
@@ -120,6 +125,553 @@ CONFIG_FILE="$SCRIPT_DIR/backup.conf"
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
 fi
+
+# Function to display paginated help
+show_paginated_help() {
+    clear
+
+    # Page 1: Overview
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border thick \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 212 \
+            --foreground 226 \
+            "📖  HELP - Page 1/5: OVERVIEW" \
+            "" \
+            "$SCRIPT_NAME v$SCRIPT_VERSION" \
+            "$SCRIPT_DESCRIPTION"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 99 \
+            "🔰 WHAT THIS SCRIPT DOES:" \
+            "" \
+            "  • Creates incremental backups of your entire home folder" \
+            "  • Uses hard links to save space (2 backups ≈ size of 1 + changes)" \
+            "  • Automatically excludes cache and temporary files" \
+            "  • Verifies backup integrity with optional SHA256 checksums" \
+            "  • Safely ejects USB drives when backups complete" \
+            "  • Sends desktop notifications and email alerts" \
+            "  • Can run automatically via cron scheduling" \
+            "" \
+            "📁 WHERE BACKUPS ARE STORED:" \
+            "  $BACKUP_DEST" \
+            "" \
+            "📋 LOGS LOCATION:" \
+            "  $LOGS_DIR"
+
+        gum confirm "Next page (2/5)?" && show_help_page2
+    else
+        # Fallback to less-based paging
+        cat << EOF | less
+${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║${NC}                        ${PURPLE}📖 HELP - Page 1/5: OVERVIEW${NC}                        ${CYAN}║${NC}
+${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
+
+${GREEN}$SCRIPT_NAME v$SCRIPT_VERSION${NC}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}🔰 WHAT THIS SCRIPT DOES:${NC}
+  • Creates incremental backups of your entire home folder
+  • Uses hard links to save space (2 backups ≈ size of 1 + changes)
+  • Automatically excludes cache and temporary files
+  • Verifies backup integrity with optional SHA256 checksums
+  • Safely ejects USB drives when backups complete
+  • Sends desktop notifications and email alerts
+  • Can run automatically via cron scheduling
+
+${CYAN}📁 WHERE BACKUPS ARE STORED:${NC}
+  $BACKUP_DEST
+
+${PURPLE}📋 LOGS LOCATION:${NC}
+  $LOGS_DIR
+
+${BLUE}🔍 INTEGRITY LOGS:${NC}
+  $INTEGRITY_DIR
+
+Press 'q' to exit, 'b' for previous page, space for next page...
+EOF
+    fi
+}
+
+show_help_page2() {
+    clear
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border thick \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 212 \
+            --foreground 226 \
+            "📖  HELP - Page 2/5: PERFORMANCE MODES" \
+            "" \
+            "Choose based on your hardware and risk tolerance"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 46 \
+            "🟢 SAFE MODE (Default):" \
+            "" \
+            "  • Uses --no-inplace (creates temp files then moves)" \
+            "  • Verifies with checksums when enabled" \
+            "  • Slowest but safest - recommended for USB/network" \
+            "  • No risk of corrupted files if interrupted"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 226 \
+            "🟡 FAST MODE:" \
+            "" \
+            "  • Uses --inplace for SSD/HDD" \
+            "  • 30% faster than safe mode" \
+            "  • Skips checksums" \
+            "  • Low risk - files may be partial if interrupted"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 196 \
+            "🔴 TURBO MODE:" \
+            "" \
+            "  • Uses --inplace and --no-whole-file" \
+            "  • 50% faster than safe mode" \
+            "  • Highest speed, highest risk" \
+            "  • Only recommended for local SSDs"
+
+        gum style \
+            --padding "1 2" \
+            --foreground 99 \
+            "💡 Tip: Use '⚡ Change Performance Mode' in menu to switch"
+
+        if gum confirm "Previous page (1/5)?"; then
+            show_paginated_help
+        elif gum confirm "Next page (3/5)?"; then
+            show_help_page3
+        fi
+    else
+        cat << EOF | less
+${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║${NC}                        ${PURPLE}📖 HELP - Page 2/5: PERFORMANCE MODES${NC}                        ${CYAN}║${NC}
+${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
+
+${GREEN}Choose based on your hardware and risk tolerance:${NC}
+
+${GREEN}🟢 SAFE MODE (Default):${NC}
+  • Uses --no-inplace (creates temp files then moves)
+  • Verifies with checksums when enabled
+  • Slowest but safest - recommended for USB/network
+  • No risk of corrupted files if interrupted
+
+${YELLOW}🟡 FAST MODE:${NC}
+  • Uses --inplace for SSD/HDD
+  • 30% faster than safe mode
+  • Skips checksums
+  • Low risk - files may be partial if interrupted
+
+${RED}🔴 TURBO MODE:${NC}
+  • Uses --inplace and --no-whole-file
+  • 50% faster than safe mode
+  • Highest speed, highest risk
+  • Only recommended for local SSDs
+
+${PURPLE}💡 Tip: Use '⚡ Change Performance Mode' in menu to switch${NC}
+
+Press 'q' to exit, 'b' for previous page, space for next page...
+EOF
+    fi
+}
+
+show_help_page3() {
+    clear
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border thick \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 212 \
+            --foreground 226 \
+            "📖  HELP - Page 3/5: SECURITY FEATURES"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 46 \
+            "🔌 AUTO-EJECT:" \
+            "" \
+            "  • Safely unmounts USB drives after backup" \
+            "  • Uses udisksctl for proper power-off" \
+            "  • Prevents data corruption from premature unplugging" \
+            "  • Protects against ransomware by physically isolating backup"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 226 \
+            "🔍 INTEGRITY VERIFICATION:" \
+            "" \
+            "  • SHA256 checksums for critical folders" \
+            "  • Detects bit rot and silent corruption" \
+            "  • Caches checksums for faster subsequent runs" \
+            "  • Email alerts for any mismatches"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 99 \
+            "🔐 ENCRYPTION:" \
+            "" \
+            "  • GPG AES256 encryption for cloud backups" \
+            "  • Protects sensitive data if backup is stolen" \
+            "  • Optional - enable with --encrypt flag"
+
+        gum style \
+            --padding "1 2" \
+            --foreground 99 \
+            "💡 Tip: Enable these in config file or with CLI flags"
+
+        if gum confirm "Previous page (2/5)?"; then
+            show_help_page2
+        elif gum confirm "Next page (4/5)?"; then
+            show_help_page4
+        fi
+    else
+        cat << EOF | less
+${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║${NC}                        ${PURPLE}📖 HELP - Page 3/5: SECURITY FEATURES${NC}                        ${CYAN}║${NC}
+${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
+
+${GREEN}🔌 AUTO-EJECT:${NC}
+  • Safely unmounts USB drives after backup
+  • Uses udisksctl for proper power-off
+  • Prevents data corruption from premature unplugging
+  • Protects against ransomware by physically isolating backup
+
+${YELLOW}🔍 INTEGRITY VERIFICATION:${NC}
+  • SHA256 checksums for critical folders
+  • Detects bit rot and silent corruption
+  • Caches checksums for faster subsequent runs
+  • Email alerts for any mismatches
+
+${PURPLE}🔐 ENCRYPTION:${NC}
+  • GPG AES256 encryption for cloud backups
+  • Protects sensitive data if backup is stolen
+  • Optional - enable with --encrypt flag
+
+${BLUE}💡 Tip: Enable these in config file or with CLI flags${NC}
+
+Press 'q' to exit, 'b' for previous page, space for next page...
+EOF
+    fi
+}
+
+show_help_page4() {
+    clear
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border thick \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 212 \
+            --foreground 226 \
+            "📖  HELP - Page 4/5: COMMAND LINE OPTIONS"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 99 \
+            "🎯 BASIC OPTIONS:" \
+            "" \
+            "  -h, --help              Show this help" \
+            "  -v, --version           Show version" \
+            "  -b, --backup            Run interactive backup" \
+            "  -c, --cron              Run silent backup (cron mode)" \
+            "  -d, --dry-run           Preview without copying" \
+            "  -s, --status            Show backup status" \
+            "  -l, --logs              View backup logs" \
+            "  -r, --restore           Restore from backup" \
+            "" \
+            "⚡ PERFORMANCE OPTIONS:" \
+            "" \
+            "  --mode [safe|fast|turbo] Set performance mode" \
+            "  --bwlimit [KB/s]        Set bandwidth limit" \
+            "" \
+            "🔒 SECURITY OPTIONS:" \
+            "" \
+            "  --encrypt                Enable GPG encryption" \
+            "  --verify                 Enable verification" \
+            "  --integrity              Enable SHA256 checksums" \
+            "  --auto-eject              Auto-eject USB drives" \
+            "  --email [address]        Email notifications"
+
+        if gum confirm "Previous page (3/5)?"; then
+            show_help_page3
+        elif gum confirm "Next page (5/5)?"; then
+            show_help_page5
+        fi
+    else
+        cat << EOF | less
+${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║${NC}                        ${PURPLE}📖 HELP - Page 4/5: COMMAND LINE OPTIONS${NC}                        ${CYAN}║${NC}
+${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
+
+${GREEN}🎯 BASIC OPTIONS:${NC}
+  -h, --help              Show this help
+  -v, --version           Show version
+  -b, --backup            Run interactive backup
+  -c, --cron              Run silent backup (cron mode)
+  -d, --dry-run           Preview without copying
+  -s, --status            Show backup status
+  -l, --logs              View backup logs
+  -r, --restore           Restore from backup
+  -u, --update-exclusions Update exclusion patterns
+  -k, --cleanup           Clean up old backups
+  --schedule              Setup automatic scheduling
+  --desktop               Create desktop shortcut
+  --info                  Show destination information
+  --generate-config       Generate sample config file
+
+${YELLOW}⚡ PERFORMANCE OPTIONS:${NC}
+  --mode [safe|fast|turbo] Set performance mode
+  --bwlimit [KB/s]        Set bandwidth limit
+
+${PURPLE}🔒 SECURITY OPTIONS:${NC}
+  --encrypt                Enable GPG encryption
+  --verify                 Enable verification
+  --integrity              Enable SHA256 checksums
+  --auto-eject              Auto-eject USB drives
+  --email [address]        Email notifications
+
+Press 'q' to exit, 'b' for previous page, space for next page...
+EOF
+    fi
+}
+
+show_help_page5() {
+    clear
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border thick \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 212 \
+            --foreground 226 \
+            "📖  HELP - Page 5/5: EXAMPLES & TIPS"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 46 \
+            "📝 BASIC USAGE EXAMPLES:" \
+            "" \
+            "  ${WHITE}# First backup (will be full)${NC}" \
+            "  ./home-backup.sh --backup" \
+            "" \
+            "  ${WHITE}# Daily cron job${NC}" \
+            "  ./home-backup.sh --cron" \
+            "" \
+            "  ${WHITE}# Preview what would be backed up${NC}" \
+            "  ./home-backup.sh --dry-run" \
+            "" \
+            "  ${WHITE}# Check backup status${NC}" \
+            "  ./home-backup.sh --status"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 226 \
+            "🚀 ADVANCED EXAMPLES:" \
+            "" \
+            "  ${WHITE}# USB drive with auto-eject${NC}" \
+            "  ./home-backup.sh --auto-eject --backup" \
+            "" \
+            "  ${WHITE}# Fast mode with integrity check${NC}" \
+            "  ./home-backup.sh --mode fast --integrity --backup" \
+            "" \
+            "  ${WHITE}# Network backup with bandwidth limit${NC}" \
+            "  ./home-backup.sh --bwlimit 1024 --backup" \
+            "" \
+            "  ${WHITE}# Encrypted backup with email notification${NC}" \
+            "  ./home-backup.sh --encrypt --email me@mail.com --cron"
+
+        gum style \
+            --border rounded \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 99 \
+            "💡 PRO TIPS:" \
+            "" \
+            "  • First backup will be slow - subsequent runs are fast!" \
+            "  • Two backups take space of one + changes (hard links)" \
+            "  • Use 'safe' mode for USB drives, 'fast' for internal SSDs" \
+            "  • Enable auto-eject to protect against ransomware" \
+            "  • Schedule with --schedule for automatic daily backups"
+
+        gum style \
+            --padding "1 2" \
+            --foreground 212 \
+            "🎉 You've reached the end of help! Press Enter to return to menu"
+
+        if gum confirm "Previous page (4/5)?"; then
+            show_help_page4
+        else
+            return
+        fi
+    else
+        cat << EOF | less
+${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║${NC}                        ${PURPLE}📖 HELP - Page 5/5: EXAMPLES & TIPS${NC}                        ${CYAN}║${NC}
+${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
+
+${GREEN}📝 BASIC USAGE EXAMPLES:${NC}
+  ${WHITE}# First backup (will be full)${NC}
+  ./home-backup.sh --backup
+
+  ${WHITE}# Daily cron job${NC}
+  ./home-backup.sh --cron
+
+  ${WHITE}# Preview what would be backed up${NC}
+  ./home-backup.sh --dry-run
+
+  ${WHITE}# Check backup status${NC}
+  ./home-backup.sh --status
+
+${YELLOW}🚀 ADVANCED EXAMPLES:${NC}
+  ${WHITE}# USB drive with auto-eject${NC}
+  ./home-backup.sh --auto-eject --backup
+
+  ${WHITE}# Fast mode with integrity check${NC}
+  ./home-backup.sh --mode fast --integrity --backup
+
+  ${WHITE}# Network backup with bandwidth limit${NC}
+  ./home-backup.sh --bwlimit 1024 --backup
+
+  ${WHITE}# Encrypted backup with email notification${NC}
+  ./home-backup.sh --encrypt --email me@mail.com --cron
+
+${PURPLE}💡 PRO TIPS:${NC}
+  • First backup will be slow - subsequent runs are fast!
+  • Two backups take space of one + changes (hard links)
+  • Use 'safe' mode for USB drives, 'fast' for internal SSDs
+  • Enable auto-eject to protect against ransomware
+  • Schedule with --schedule for automatic daily backups
+
+${CYAN}🎉 You've reached the end of help! Press 'q' to exit.${NC}
+EOF
+    fi
+}
+
+# Function to display color-coded log summary
+show_log_summary() {
+    clear
+
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border double \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 33 \
+            "📋  LOG SUMMARY" \
+            "" \
+            "Color-coded view of recent backup logs"
+    else
+        print_header
+        echo -e "${BLUE}📋 LOG SUMMARY${NC}"
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    fi
+
+    # Find all log files
+    local logs=()
+    while IFS= read -r -d '' log; do
+        logs+=("$log")
+    done < <(find "$LOGS_DIR" -maxdepth 1 -type f -name "backup_*.log" -print0 | sort -r)
+
+    if [ ${#logs[@]} -eq 0 ]; then
+        echo -e "${RED}❌ No logs found in $LOGS_DIR${NC}"
+        sleep 2
+        return
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Recent backup logs (newest first):${NC}"
+    echo ""
+
+    for i in "${!logs[@]}"; do
+        local log="${logs[$i]}"
+        local log_name=$(basename "$log")
+        local log_date=${log_name#backup_}
+        log_date=${log_date%.log}
+        local log_size=$(du -sh "$log" 2>/dev/null | cut -f1)
+
+        # Check if backup was successful by looking for "completed successfully" in log
+        if grep -q "completed successfully" "$log"; then
+            local status="${GREEN}✅ SUCCESS${NC}"
+        elif grep -q "FAILED" "$log"; then
+            local status="${RED}❌ FAILED${NC}"
+        else
+            local status="${YELLOW}⚠️ INCOMPLETE${NC}"
+        fi
+
+        # Get backup type if available
+        local backup_type=$(grep "Type:" "$log" | head -1 | cut -d':' -f2 | xargs)
+        local backup_size=$(grep "Size:" "$log" | head -1 | cut -d':' -f2 | xargs)
+
+        printf "  ${CYAN}%2d.${NC} %-25s ${status}  Type: %-12s Size: %-10s\n" \
+            $((i+1)) "${log_date//_/ }" "$backup_type" "$backup_size"
+    done
+
+    echo ""
+    echo -e "${BLUE}Options:${NC}"
+    echo -e "  ${GREEN}1-${#logs[@]}${NC} - View specific log"
+    echo -e "  ${GREEN}s${NC}      - Show summary only"
+    echo -e "  ${GREEN}q${NC}      - Quit"
+    echo ""
+
+    if command -v gum &> /dev/null; then
+        choice=$(gum input --placeholder="Enter choice (number/s/q)")
+    else
+        echo -e "${YELLOW}Enter choice:${NC}"
+        read -r choice
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#logs[@]} ]; then
+        # View the selected log
+        local selected_log="${logs[$((choice-1))]}"
+        if command -v gum &> /dev/null; then
+            clear
+            gum style --border thick --padding "1 2" --border-foreground 99 "📄 $(basename "$selected_log")"
+
+            # Color-code the log content based on success/failure
+            if grep -q "completed successfully" "$selected_log"; then
+                gum style --foreground 46 "$(cat "$selected_log")"
+            elif grep -q "FAILED" "$selected_log"; then
+                gum style --foreground 196 "$(cat "$selected_log")"
+            else
+                cat "$selected_log"
+            fi
+            gum confirm "Press Enter to continue"
+        else
+            less "$selected_log"
+        fi
+    elif [ "$choice" = "s" ]; then
+        # Just show summary again
+        show_log_summary
+    fi
+}
 
 # Function to send email notifications (for cron jobs)
 send_email() {
@@ -406,84 +958,7 @@ get_performance_flags() {
 
 # Function to display help
 show_help() {
-    cat << EOF
-${CYAN}╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
-${CYAN}║${NC}                                          ${PURPLE}🏠 $SCRIPT_NAME${NC}                                           ${CYAN}║${NC}
-${CYAN}║${NC}                                                ${YELLOW}v$SCRIPT_VERSION${NC}                                                 ${CYAN}║${NC}
-${CYAN}╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
-
-${GREEN}DESCRIPTION:${NC}
-  $SCRIPT_DESCRIPTION
-
-${GREEN}AUTHOR:${NC} $SCRIPT_AUTHOR
-${GREEN}WEBSITE:${NC} $SCRIPT_WEBSITE
-${GREEN}GITHUB:${NC} $SCRIPT_GITHUB
-${GREEN}BUILD DATE:${NC} $SCRIPT_BUILD_DATE
-
-${GREEN}USAGE:${NC}
-  $(basename "$0") [OPTION]
-
-${GREEN}OPTIONS:${NC}
-  ${YELLOW}-h, --help${NC}           Show this help message
-  ${YELLOW}-v, --version${NC}        Show version information
-  ${YELLOW}-b, --backup${NC}         Run backup in interactive mode
-  ${YELLOW}-c, --cron${NC}           Run backup in silent cron mode (no output)
-  ${YELLOW}-d, --dry-run${NC}        Perform a dry run (preview without copying)
-  ${YELLOW}-s, --status${NC}         Show backup status
-  ${YELLOW}-l, --logs${NC}           View backup logs
-  ${YELLOW}-r, --restore${NC}        Restore from backup (interactive)
-  ${YELLOW}-u, --update-exclusions${NC}  Update exclusion patterns
-  ${YELLOW}-k, --cleanup${NC}        Clean up old backups manually
-  ${YELLOW}--schedule${NC}            Setup automatic scheduling
-  ${YELLOW}--desktop${NC}             Create desktop shortcut
-  ${YELLOW}--info${NC}                Show destination information
-  ${YELLOW}--mode [safe|fast|turbo]${NC}  Set performance mode
-  ${YELLOW}--encrypt${NC}             Enable backup encryption
-  ${YELLOW}--verify${NC}              Enable backup verification
-  ${YELLOW}--integrity${NC}           Enable SHA256 integrity verification
-  ${YELLOW}--auto-eject${NC}          Auto-eject USB drive after backup
-  ${YELLOW}--email [address]${NC}     Enable email notifications
-  ${YELLOW}--bwlimit [KB/s]${NC}      Set bandwidth limit
-  ${YELLOW}--generate-config${NC}     Generate a sample config file
-
-${GREEN}PERFORMANCE MODES:${NC}
-  ${CYAN}safe${NC}   - Default, uses --no-inplace, verifies with checksums (safest)
-  ${CYAN}fast${NC}   - Uses --inplace for SSD speed, skips checksums (faster)
-  ${CYAN}turbo${NC}  - Uses --inplace and --no-whole-file (fastest, riskier)
-
-${GREEN}SECURITY FEATURES:${NC}
-  ${CYAN}auto-eject${NC}   - Safely unmounts USB drives after backup
-  ${CYAN}integrity${NC}    - SHA256 checksums for critical folders
-  ${CYAN}encryption${NC}   - GPG encryption for cloud backups
-
-${GREEN}EXAMPLES:${NC}
-  ${BLUE}# Run with safe mode and auto-eject${NC}
-  $(basename "$0") --mode safe --auto-eject --backup
-
-  ${BLUE}# Run with integrity verification${NC}
-  $(basename "$0") --integrity --backup
-
-  ${BLUE}# Run with auto-eject for USB drives${NC}
-  $(basename "$0") --auto-eject --backup
-
-  ${BLUE}# Generate sample config file${NC}
-  $(basename "$0") --generate-config
-
-${GREEN}STORAGE NOTES:${NC}
-  ${PURPLE}• Due to hard links, file managers show 'apparent' size${NC}
-  ${PURPLE}• Actual space used is much less! Run: du -sh $BACKUP_DEST${NC}
-  ${PURPLE}• Two backups typically take space of one + changes${NC}
-  ${PURPLE}• The 'latest' symlink always points to the last SUCCESSFUL backup${NC}
-
-${GREEN}FOLDERS:${NC}
-  ${CYAN}Script:${NC}    $SCRIPT_DIR
-  ${CYAN}Backups:${NC}   $BACKUP_DEST
-  ${CYAN}Logs:${NC}      $LOGS_DIR
-  ${CYAN}Integrity:${NC} $INTEGRITY_DIR
-  ${CYAN}Config:${NC}    $SCRIPT_DIR/backup.conf
-
-${GREEN}LICENSE:${NC} MIT
-EOF
+    show_paginated_help
     exit 0
 }
 
@@ -1097,7 +1572,7 @@ cleanup_old_integrity() {
     fi
 }
 
-# Function to view logs
+# Function to view logs (with color-coded summary option)
 view_logs() {
     clear
 
@@ -1110,12 +1585,31 @@ view_logs() {
             "📋  LOG VIEWER" \
             "" \
             "View backup logs from $LOGS_DIR"
-    else
-        print_header
-        echo -e "${PURPLE}📋 LOG VIEWER${NC}"
-        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+        local log_choice=$(gum choose "📊 Show Summary" "📄 Browse All Logs" "🔍 Search Logs" "↩️ Back")
+
+        case $log_choice in
+            "📊 Show Summary")
+                show_log_summary
+                ;;
+            "📄 Browse All Logs")
+                # Continue to regular log browser
+                ;;
+            "🔍 Search Logs")
+                local search_term=$(gum input --placeholder="Enter search term")
+                if [ -n "$search_term" ]; then
+                    grep -r "$search_term" "$LOGS_DIR"/*.log 2>/dev/null | gum style --foreground 226
+                    gum confirm "Press Enter to continue"
+                fi
+                return
+                ;;
+            *)
+                return
+                ;;
+        esac
     fi
 
+    # Original log viewer (if not using summary or gum not available)
     # Find all log files
     local logs=()
     while IFS= read -r -d '' log; do
@@ -1141,7 +1635,15 @@ view_logs() {
         local size=$(du -sh "$log" 2>/dev/null | cut -f1)
         local date_part=${name#backup_}
         date_part=${date_part%.log}
-        log_options+=("$date_part [$size]")
+
+        # Color-code based on success/failure
+        if grep -q "completed successfully" "$log"; then
+            log_options+=("$date_part [$size] ✅")
+        elif grep -q "FAILED" "$log"; then
+            log_options+=("$date_part [$size] ❌")
+        else
+            log_options+=("$date_part [$size] ⚠️")
+        fi
     done
 
     echo ""
@@ -1178,12 +1680,15 @@ view_logs() {
             # Display log with gum
             local log_content=$(cat "$selected_log")
             local log_name=$(basename "$selected_log")
-            gum style \
-                --border thick \
-                --padding "1 2" \
-                --margin "1" \
-                --border-foreground 99 \
-                "📄 $log_name"
+
+            # Color-code the header based on success/failure
+            if grep -q "completed successfully" "$selected_log"; then
+                gum style --border thick --padding "1 2" --border-foreground 46 "📄 $log_name"
+            elif grep -q "FAILED" "$selected_log"; then
+                gum style --border thick --padding "1 2" --border-foreground 196 "📄 $log_name"
+            else
+                gum style --border thick --padding "1 2" --border-foreground 226 "📄 $log_name"
+            fi
 
             echo "$log_content" | gum style --foreground 226
 
@@ -2628,7 +3133,14 @@ do_restore() {
             if [ $i -gt 0 ]; then
                 type="Incremental"
             fi
-            backup_options+=("$date_part [$size] - $type")
+
+            # Color-code based on success (if we have logs)
+            local log_file="$LOGS_DIR/backup_${date_part}.log"
+            if [ -f "$log_file" ] && grep -q "completed successfully" "$log_file"; then
+                backup_options+=("$date_part [$size] ✅ - $type")
+            else
+                backup_options+=("$date_part [$size] - $type")
+            fi
         fi
     done
 
@@ -3259,12 +3771,13 @@ show_menu() {
             --cursor="👉 " \
             --cursor.foreground="212" \
             --selected.foreground="212" \
-            --height=17 \
+            --height=18 \
             "💾 Create Backup (Incremental)" \
             "🔍 Dry Run (Preview)" \
             "♻️  Restore Backup" \
             "📊 View Status" \
             "📋 View Logs" \
+            "📊 Log Summary" \
             "🔍 Update Exclusions" \
             "🧹 Cleanup Old Backups" \
             "⏰ Schedule Automatic Backups" \
@@ -3272,6 +3785,7 @@ show_menu() {
             "🔌 Toggle Auto-Eject" \
             "🖥️  Create Desktop Shortcut" \
             "ℹ️  Destination Info" \
+            "📖 Help" \
             "❌ Exit")
 
         case $choice in
@@ -3289,6 +3803,9 @@ show_menu() {
                 ;;
             "📋 View Logs")
                 view_logs
+                ;;
+            "📊 Log Summary")
+                show_log_summary
                 ;;
             "🔍 Update Exclusions")
                 update_exclusions
@@ -3310,6 +3827,9 @@ show_menu() {
                 ;;
             "ℹ️  Destination Info")
                 show_destination_info
+                ;;
+            "📖 Help")
+                show_paginated_help
                 ;;
             "❌ Exit")
                 clear
@@ -3334,14 +3854,16 @@ show_menu() {
             echo -e "${GREEN}3.${NC} ♻️  Restore Backup"
             echo -e "${GREEN}4.${NC} 📊 View Status"
             echo -e "${GREEN}5.${NC} 📋 View Logs"
-            echo -e "${GREEN}6.${NC} 🔍 Update Exclusions"
-            echo -e "${GREEN}7.${NC} 🧹 Cleanup Old Backups"
-            echo -e "${GREEN}8.${NC} ⏰ Schedule Automatic Backups"
-            echo -e "${GREEN}9.${NC} ⚡ Change Performance Mode"
-            echo -e "${GREEN}10.${NC} 🔌 Toggle Auto-Eject"
-            echo -e "${GREEN}11.${NC} 🖥️  Create Desktop Shortcut"
-            echo -e "${GREEN}12.${NC} ℹ️  Destination Info"
-            echo -e "${GREEN}13.${NC} ❌ Exit"
+            echo -e "${GREEN}6.${NC} 📊 Log Summary"
+            echo -e "${GREEN}7.${NC} 🔍 Update Exclusions"
+            echo -e "${GREEN}8.${NC} 🧹 Cleanup Old Backups"
+            echo -e "${GREEN}9.${NC} ⏰ Schedule Automatic Backups"
+            echo -e "${GREEN}10.${NC} ⚡ Change Performance Mode"
+            echo -e "${GREEN}11.${NC} 🔌 Toggle Auto-Eject"
+            echo -e "${GREEN}12.${NC} 🖥️  Create Desktop Shortcut"
+            echo -e "${GREEN}13.${NC} ℹ️  Destination Info"
+            echo -e "${GREEN}14.${NC} 📖 Help"
+            echo -e "${GREEN}15.${NC} ❌ Exit"
             echo ""
 
             # Show disk space warning
@@ -3368,7 +3890,7 @@ show_menu() {
             fi
 
             echo ""
-            echo -e "${YELLOW}Choice [1-13]:${NC}"
+            echo -e "${YELLOW}Choice [1-15]:${NC}"
             read -r choice
 
             case $choice in
@@ -3377,14 +3899,16 @@ show_menu() {
                 3) do_restore ;;
                 4) show_status ;;
                 5) view_logs ;;
-                6) update_exclusions ;;
-                7) do_cleanup ;;
-                8) setup_scheduling ;;
-                9) change_performance_mode ;;
-                10) toggle_auto_eject ;;
-                11) create_desktop_shortcut ;;
-                12) show_destination_info ;;
-                13)
+                6) show_log_summary ;;
+                7) update_exclusions ;;
+                8) do_cleanup ;;
+                9) setup_scheduling ;;
+                10) change_performance_mode ;;
+                11) toggle_auto_eject ;;
+                12) create_desktop_shortcut ;;
+                13) show_destination_info ;;
+                14) show_paginated_help ;;
+                15)
                     clear
                     echo -e "${GREEN}Goodbye! 👋${NC}"
                     exit 0
@@ -3402,7 +3926,7 @@ show_menu() {
 parse_arguments() {
     case "$1" in
         -h|--help)
-            show_help
+            show_paginated_help
             ;;
         -v|--version)
             show_version
@@ -3421,6 +3945,9 @@ parse_arguments() {
             ;;
         -l|--logs)
             view_logs
+            ;;
+        --log-summary)
+            show_log_summary
             ;;
         -r|--restore)
             do_restore
