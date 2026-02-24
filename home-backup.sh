@@ -4,7 +4,7 @@
 # Wael Isa
 # Web site  https://www.wael.name
 # GitHub     https://github.com/waelisa/home-backup
-# v1.0.8
+# v1.1.0
 # Build Date: 02/24/2026
 #
 # ██╗    ██╗ █████╗ ███████╗██╗         ██╗███████╗ █████╗
@@ -16,9 +16,12 @@
 #
 # Description: A comprehensive backup tool for your home folder with smart exclusions,
 #              true incremental backups using hard links, atomic symlink updates,
-#              desktop integration, and automatic scheduling.
+#              desktop integration, automatic scheduling, and universal path support.
 #
 # Features:
+#   • Universal path detection - works anywhere (USB drives, external disks, network mounts)
+#   • Smart mount checking - verifies destination is accessible before backup
+#   • Warning when running from home folder (prevents backing up to itself)
 #   • True incremental backups with hard links (space efficient)
 #   • Smart exclusion detection (internet search + local software detection)
 #   • Atomic symlink updates (never points to failed backups)
@@ -43,7 +46,7 @@
 
 # Script configuration
 SCRIPT_NAME="Home Folder Backup Utility"
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_DESCRIPTION="A comprehensive backup tool for your home folder with smart exclusions"
 SCRIPT_AUTHOR="Wael Isa"
 SCRIPT_WEBSITE="https://www.wael.name"
@@ -67,6 +70,154 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# Function to check if script is running from home folder
+check_script_location() {
+    if [[ "$SCRIPT_DIR" == "$HOME"* ]] && [ "$SCRIPT_DIR" != "$HOME" ]; then
+        echo -e "${YELLOW}⚠️  Warning: Script is running from a subfolder of your home directory:${NC}"
+        echo -e "  ${CYAN}$SCRIPT_DIR${NC}"
+        echo -e "${YELLOW}  Backups will be stored in: $BACKUP_DEST${NC}"
+        echo -e "${YELLOW}  This means you're backing up your home folder to itself!${NC}"
+        echo -e "${RED}  ⚠️  This is NOT recommended! ⚠️${NC}"
+        echo -e "${GREEN}  Consider moving this script to an external drive or different partition.${NC}"
+        echo ""
+        if command -v gum &> /dev/null; then
+            if ! gum confirm "Continue anyway?"; then
+                exit 1
+            fi
+        else
+            echo -e "${YELLOW}Continue anyway? (y/n)${NC}"
+            read -r force_continue
+            if [[ ! "$force_continue" =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
+        fi
+    elif [ "$SCRIPT_DIR" == "$HOME" ]; then
+        echo -e "${RED}❌ ERROR: Script is running directly from your home folder!${NC}"
+        echo -e "${RED}   $SCRIPT_DIR${NC}"
+        echo -e "${YELLOW}  This would create Backups/ inside your home folder, backing up to itself.${NC}"
+        echo -e "${GREEN}  Please move this script to a different location:${NC}"
+        echo -e "  • External USB drive: /media/username/backup_drive/"
+        echo -e "  • Another partition:   /mnt/backups/"
+        echo -e "  • Network share:       /networkshare/backups/"
+        exit 1
+    else
+        echo -e "${GREEN}✅ Script location OK (outside home folder)${NC}"
+        echo -e "  📁 Script: $SCRIPT_DIR"
+    fi
+}
+
+# Function to check if destination is accessible (for USB drives, network mounts, etc.)
+check_destination_accessible() {
+    local dest_dir="$BACKUP_DEST"
+    local cron_mode=$1
+
+    # Check if we can write to the destination
+    if [ ! -d "$(dirname "$dest_dir")" ]; then
+        if [ -z "$cron_mode" ]; then
+            echo -e "${RED}❌ Destination parent directory does not exist: $(dirname "$dest_dir")${NC}"
+        fi
+        return 1
+    fi
+
+    # Try to create a test file
+    local test_file="$dest_dir/.write_test_$TIMESTAMP"
+    mkdir -p "$dest_dir" 2>/dev/null
+    if ! touch "$test_file" 2>/dev/null; then
+        if [ -z "$cron_mode" ]; then
+            echo -e "${RED}❌ Cannot write to destination: $dest_dir${NC}"
+            echo -e "${YELLOW}  This could mean:${NC}"
+            echo -e "  • USB drive not mounted"
+            echo -e "  • Network share disconnected"
+            echo -e "  • Permission denied"
+        fi
+        return 1
+    else
+        rm -f "$test_file"
+        if [ -z "$cron_mode" ]; then
+            echo -e "${GREEN}✅ Destination is accessible and writable${NC}"
+        fi
+        return 0
+    fi
+}
+
+# Function to detect mount type (USB, network, local)
+detect_mount_type() {
+    local dest_dir="$BACKUP_DEST"
+    local mount_point=$(df -P "$dest_dir" 2>/dev/null | tail -1 | awk '{print $6}')
+    local fs_type=$(df -T "$dest_dir" 2>/dev/null | tail -1 | awk '{print $2}')
+
+    if [ -z "$mount_point" ] || [ -z "$fs_type" ]; then
+        echo "unknown"
+        return
+    fi
+
+    # Check if it's a USB drive (common patterns)
+    if [[ "$mount_point" == /media/* ]] || [[ "$mount_point" == /run/media/* ]] || [[ "$mount_point" == /mnt/* ]]; then
+        # Check if it's on a removable device
+        if lsblk -o MOUNTPOINT,RM 2>/dev/null | grep -q "$mount_point.*1"; then
+            echo "usb"
+            return
+        fi
+    fi
+
+    # Check if it's a network filesystem
+    case "$fs_type" in
+        nfs|nfs4|cifs|smb|fuse.sshfs)
+            echo "network"
+            return
+            ;;
+    esac
+
+    # Check if it's on the same device as home
+    local home_device=$(df -P "$HOME" 2>/dev/null | tail -1 | awk '{print $1}')
+    local dest_device=$(df -P "$dest_dir" 2>/dev/null | tail -1 | awk '{print $1}')
+
+    if [ "$home_device" == "$dest_device" ]; then
+        echo "same_device"
+    else
+        echo "different_device"
+    fi
+}
+
+# Function to show mount information
+show_mount_info() {
+    local mount_type=$(detect_mount_type)
+    local dest_dir="$BACKUP_DEST"
+    local mount_point=$(df -P "$dest_dir" 2>/dev/null | tail -1 | awk '{print $6}')
+    local fs_type=$(df -T "$dest_dir" 2>/dev/null | tail -1 | awk '{print $2}')
+
+    echo -e "${BLUE}📌 Destination Information:${NC}"
+    echo -e "  📁 Path: $dest_dir"
+
+    case "$mount_type" in
+        usb)
+            echo -e "  💾 Type: ${PURPLE}USB Drive${NC}"
+            echo -e "  🔌 Status: ${GREEN}Connected${NC}"
+            ;;
+        network)
+            echo -e "  🌐 Type: ${PURPLE}Network Mount${NC} ($fs_type)"
+            echo -e "  📡 Status: ${GREEN}Connected${NC}"
+            ;;
+        different_device)
+            echo -e "  💿 Type: ${PURPLE}Different Device${NC}"
+            echo -e "  ✅ Status: ${GREEN}Optimal${NC}"
+            ;;
+        same_device)
+            echo -e "  ⚠️  Type: ${YELLOW}Same Device as Home${NC}"
+            echo -e "  ⚠️  Warning: Backing up to same drive as source!"
+            ;;
+        *)
+            echo -e "  ❓ Type: ${YELLOW}Unknown${NC}"
+            ;;
+    esac
+
+    if [ -n "$mount_point" ] && [ "$mount_point" != "/" ]; then
+        echo -e "  📍 Mount: $mount_point"
+    fi
+
+    echo ""
+}
 
 # Function to display help
 show_help() {
@@ -100,6 +251,7 @@ ${GREEN}OPTIONS:${NC}
   ${YELLOW}-k, --cleanup${NC}     Clean up old backups manually
   ${YELLOW}--schedule${NC}        Setup automatic scheduling
   ${YELLOW}--desktop${NC}         Create desktop shortcut
+  ${YELLOW}--info${NC}            Show destination information
 
 ${GREEN}EXAMPLES:${NC}
   ${BLUE}# Run interactive backup${NC}
@@ -108,13 +260,10 @@ ${GREEN}EXAMPLES:${NC}
   ${BLUE}# Run silent backup for cron jobs${NC}
   $(basename "$0") --cron
 
-  ${BLUE}# Preview what would be backed up${NC}
-  $(basename "$0") --dry-run
+  ${BLUE}# Check if USB drive is mounted before backup${NC}
+  $(basename "$0") --info
 
-  ${BLUE}# Check backup status${NC}
-  $(basename "$0") --status
-
-  ${BLUE}# Setup daily automatic backups${NC}
+  ${BLUE}# Setup daily automatic backups to USB drive${NC}
   $(basename "$0") --schedule
 
 ${GREEN}STORAGE NOTES:${NC}
@@ -124,8 +273,15 @@ ${GREEN}STORAGE NOTES:${NC}
   ${PURPLE}• The 'latest' symlink always points to the last SUCCESSFUL backup${NC}
 
 ${GREEN}FOLDERS:${NC}
+  ${CYAN}Script:${NC}  $SCRIPT_DIR
   ${CYAN}Backups:${NC} $BACKUP_DEST
   ${CYAN}Logs:   ${NC} $LOGS_DIR
+
+${GREEN}MOUNT TYPES DETECTED:${NC}
+  ${CYAN}USB Drive${NC}      - Backing up to removable media
+  ${CYAN}Network Mount${NC}   - Backing up to network share
+  ${CYAN}Different Device${NC}- Backing up to separate disk (optimal)
+  ${CYAN}Same Device${NC}     - Backing up to same drive (not recommended)
 
 ${GREEN}LICENSE:${NC} MIT
 EOF
@@ -140,6 +296,47 @@ show_version() {
     echo "Website: $SCRIPT_WEBSITE"
     echo "GitHub: $SCRIPT_GITHUB"
     exit 0
+}
+
+# Function to show destination info
+show_destination_info() {
+    clear
+    print_header
+    echo -e "${BLUE}📌 DESTINATION INFORMATION${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    # Show script location check
+    check_script_location
+
+    echo ""
+
+    # Show mount information
+    show_mount_info
+
+    # Show destination accessibility
+    if check_destination_accessible; then
+        # Show free space
+        local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
+        if [ ! -z "$free_space_mb" ]; then
+            local free_space_hr=$(numfmt --to=iec $((free_space_mb * 1024 * 1024)) 2>/dev/null || echo "${free_space_mb}MB")
+            echo -e "${GREEN}💾 Free space: $free_space_hr${NC}"
+        fi
+    else
+        echo -e "${RED}❌ Destination is NOT accessible!${NC}"
+        echo -e "${YELLOW}  Possible issues:${NC}"
+        echo -e "  • USB drive not plugged in"
+        echo -e "  • Network share disconnected"
+        echo -e "  • Permissions problem"
+    fi
+
+    echo ""
+    if command -v gum &> /dev/null; then
+        gum confirm "Press Enter to continue" && return
+    else
+        echo -e "\n${BLUE}Press Enter to continue...${NC}"
+        read -r
+    fi
 }
 
 # Function to send desktop notifications
@@ -505,7 +702,7 @@ view_logs() {
         selected_date=$(echo "$selected" | cut -d' ' -f1)
         selected_log="$LOGS_DIR/backup_${selected_date}.log"
     else
-        echo -e "${CYAN}Available logs:${NC}"
+        echo -e ${CYAN}Available logs:${NC}
         for i in "${!log_options[@]}"; do
             echo -e "  $((i+1)). ${log_options[$i]}"
         done
@@ -1186,6 +1383,25 @@ do_backup() {
         cron_mode="cron"
     fi
 
+    # Check script location (warn if in home folder)
+    if ! is_cron_mode "$cron_mode"; then
+        check_script_location
+        echo ""
+    fi
+
+    # Check if destination is accessible (for USB drives, network mounts, etc.)
+    if ! check_destination_accessible "$cron_mode"; then
+        if is_cron_mode "$cron_mode"; then
+            echo "$(date): Backup aborted - destination not accessible (USB drive not mounted?)" >> "$LOG_FILE"
+        fi
+        return 1
+    fi
+
+    # Show mount information in interactive mode
+    if ! is_cron_mode "$cron_mode"; then
+        show_mount_info
+    fi
+
     # Find the last backup for incremental linking
     local last_backup=$(find_last_backup)
     local link_dest_param=""
@@ -1514,6 +1730,13 @@ show_status() {
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     fi
 
+    # Show script location
+    check_script_location
+    echo ""
+
+    # Show mount information
+    show_mount_info
+
     # Show disk space status
     local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
     if [ ! -z "$free_space_mb" ]; then
@@ -1731,6 +1954,13 @@ do_restore() {
         echo -e "${RED}This will OVERWRITE your current home folder!${NC}"
     fi
 
+    # Check if destination is accessible
+    if ! check_destination_accessible; then
+        echo -e "${RED}❌ Cannot access backup destination. Is the drive mounted?${NC}"
+        sleep 3
+        return
+    fi
+
     # Find available backups
     local backups=()
     while IFS= read -r -d '' backup; do
@@ -1888,6 +2118,13 @@ do_cleanup() {
         echo -e "This will remove old backups, keeping only the $MAX_BACKUPS most recent."
     fi
 
+    # Check if destination is accessible
+    if ! check_destination_accessible; then
+        echo -e "${RED}❌ Cannot access backup destination. Is the drive mounted?${NC}"
+        sleep 3
+        return
+    fi
+
     # Show current backups
     local backups=()
     while IFS= read -r -d '' backup; do
@@ -2007,6 +2244,9 @@ setup_scheduling() {
         echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     fi
 
+    # Show mount info to help user understand where they're backing up to
+    show_mount_info
+
     echo ""
     echo -e "This will add a cron job to run backups automatically."
     echo -e "Choose your preferred schedule:"
@@ -2100,6 +2340,15 @@ setup_scheduling() {
         echo ""
         echo -e "${BLUE}Current crontab:${NC}"
         crontab -l
+
+        # Add note about USB drives for cron jobs
+        local mount_type=$(detect_mount_type)
+        if [ "$mount_type" == "usb" ]; then
+            echo ""
+            echo -e "${YELLOW}⚠️  Note: You're backing up to a USB drive.${NC}"
+            echo -e "${YELLOW}   For cron jobs to work, the drive must be mounted at backup time.${NC}"
+            echo -e "${YELLOW}   Consider using a permanently mounted drive for automated backups.${NC}"
+        fi
     fi
 
     echo ""
@@ -2124,7 +2373,44 @@ show_menu() {
             --foreground 226 \
             "🏠  $SCRIPT_NAME v$SCRIPT_VERSION" \
             "" \
-            "True incremental backups with hard links"
+            "Universal backup tool - works anywhere (USB, network, local)"
+
+        # Show script location warning if needed
+        if [[ "$SCRIPT_DIR" == "$HOME"* ]]; then
+            gum style \
+                --padding "0 2" \
+                --foreground 196 \
+                "⚠️  WARNING: Script running from home folder!"
+        fi
+
+        # Show mount type in menu
+        local mount_type=$(detect_mount_type)
+        case "$mount_type" in
+            usb)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 46 \
+                    "💾 Destination: USB Drive"
+                ;;
+            network)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 99 \
+                    "🌐 Destination: Network Mount"
+                ;;
+            different_device)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 46 \
+                    "💿 Destination: Different Device (optimal)"
+                ;;
+            same_device)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 226 \
+                    "⚠️  Destination: Same Device (not recommended)"
+                ;;
+        esac
 
         # Show disk space warning if needed
         local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
@@ -2192,7 +2478,7 @@ show_menu() {
             --cursor="👉 " \
             --cursor.foreground="212" \
             --selected.foreground="212" \
-            --height=13 \
+            --height=14 \
             "💾 Create Backup (Incremental)" \
             "🔍 Dry Run (Preview)" \
             "♻️  Restore Backup" \
@@ -2202,6 +2488,7 @@ show_menu() {
             "🧹 Cleanup Old Backups" \
             "⏰ Schedule Automatic Backups" \
             "🖥️  Create Desktop Shortcut" \
+            "ℹ️  Destination Info" \
             "❌ Exit")
 
         case $choice in
@@ -2232,6 +2519,9 @@ show_menu() {
             "🖥️  Create Desktop Shortcut")
                 create_desktop_shortcut
                 ;;
+            "ℹ️  Destination Info")
+                show_destination_info
+                ;;
             "❌ Exit")
                 clear
                 gum style --foreground 212 "Goodbye! 👋"
@@ -2242,6 +2532,14 @@ show_menu() {
         # Fallback menu without gum
         while true; do
             print_header
+
+            # Show script location warning
+            check_script_location
+            echo ""
+
+            # Show mount information
+            show_mount_info
+
             echo -e "${GREEN}1.${NC} 💾 Create Backup (Incremental)"
             echo -e "${GREEN}2.${NC} 🔍 Dry Run (Preview)"
             echo -e "${GREEN}3.${NC} ♻️  Restore Backup"
@@ -2251,7 +2549,8 @@ show_menu() {
             echo -e "${GREEN}7.${NC} 🧹 Cleanup Old Backups"
             echo -e "${GREEN}8.${NC} ⏰ Schedule Automatic Backups"
             echo -e "${GREEN}9.${NC} 🖥️  Create Desktop Shortcut"
-            echo -e "${GREEN}10.${NC} ❌ Exit"
+            echo -e "${GREEN}10.${NC} ℹ️  Destination Info"
+            echo -e "${GREEN}11.${NC} ❌ Exit"
             echo ""
 
             # Show disk space warning
@@ -2278,7 +2577,7 @@ show_menu() {
             fi
 
             echo ""
-            echo -e "${YELLOW}Choice [1-10]:${NC}"
+            echo -e "${YELLOW}Choice [1-11]:${NC}"
             read -r choice
 
             case $choice in
@@ -2291,7 +2590,8 @@ show_menu() {
                 7) do_cleanup ;;
                 8) setup_scheduling ;;
                 9) create_desktop_shortcut ;;
-                10)
+                10) show_destination_info ;;
+                11)
                     clear
                     echo -e "${GREEN}Goodbye! 👋${NC}"
                     exit 0
@@ -2343,6 +2643,9 @@ parse_arguments() {
             ;;
         --desktop)
             create_desktop_shortcut
+            ;;
+        --info)
+            show_destination_info
             ;;
         "")
             # No arguments, run interactive mode
