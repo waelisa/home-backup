@@ -2,9 +2,9 @@
 #############################################################################################################################
 #
 # Wael Isa
-# Web site  https://www.wael.name
-# GitHub     https://github.com/waelisa/home-backup
-# v1.1.1
+# Website:  https://www.wael.name
+# GitHub:   https://github.com/waelisa/home-backup
+# Version:  v1.1.2
 # Build Date: 02/24/2026
 #
 # ██╗    ██╗ █████╗ ███████╗██╗         ██╗███████╗ █████╗
@@ -14,16 +14,17 @@
 # ╚███╔███╔╝██║  ██║███████╗███████╗    ██║███████║██║  ██║
 # ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝    ╚═╝╚══════╝╚═╝  ╚═╝
 #
-# Description: A comprehensive backup tool for your home folder with smart exclusions,
+# Description: A bulletproof backup tool for your home folder with smart exclusions,
 #              true incremental backups using hard links, atomic symlink updates,
 #              desktop integration, automatic scheduling, and universal path support.
 #
 # Features:
 #   • Universal path detection - works anywhere (USB drives, external disks, network mounts)
 #   • Smart mount checking - verifies destination is accessible before backup
-#   • Performance tuning options (safe vs fast modes)
-#   • Encryption support for cloud backups
-#   • Data verification with checksums
+#   • Auto-eject for USB drives - safely unmounts drive after backup
+#   • Integrity verification - SHA256 checksums for critical data
+#   • Performance tuning options (safe vs fast vs turbo modes)
+#   • Encryption support for cloud backups (GPG)
 #   • Email notifications for cron jobs
 #   • Bandwidth limiting for network backups
 #   • True incremental backups with hard links (space efficient)
@@ -39,13 +40,20 @@
 #   • CLI arguments for all operations
 #
 # Performance Modes:
-#   • Safe Mode (default) - Uses --no-inplace, verifies with checksums
-#   • Fast Mode - Uses --inplace for SSD speed, skips checksums
-#   • Turbo Mode - Uses --inplace and --no-whole-file for maximum speed
+#   • safe   - Default, uses --no-inplace, verifies with checksums (safest)
+#   • fast   - Uses --inplace for SSD speed, skips checksums (faster)
+#   • turbo  - Uses --inplace and --no-whole-file (fastest, riskier)
+#
+# Security Features:
+#   • Auto-eject - Safely unmounts USB drives after backup
+#   • Integrity verification - SHA256 checksums for critical data
+#   • Emergency thresholds - Prevents backup with critically low space
+#   • Atomic symlinks - Never points to failed backups
 #
 # Requirements:
-#   • rsync, gum (optional, for beautiful UI), notify-send (optional)
-#   • gpg (optional, for encryption), mail (optional, for email notifications)
+#   • rsync, gum (optional), notify-send (optional)
+#   • udisks2 (for auto-eject), gpg (optional, for encryption)
+#   • mail/mailx (optional, for email notifications)
 #
 # Author: Wael Isa
 # Website: https://www.wael.name
@@ -64,13 +72,14 @@
 #   v1.0.8 - Professional header and success link
 #   v1.1.0 - Universal path detection & USB support
 #   v1.1.1 - Performance tuning, encryption, verification
+#   v1.1.2 - Auto-eject for USB drives, integrity verification
 #
 #############################################################################################################################
 
 # Script configuration
 SCRIPT_NAME="Home Folder Backup Utility"
-SCRIPT_VERSION="1.1.1"
-SCRIPT_DESCRIPTION="A comprehensive backup tool for your home folder with smart exclusions"
+SCRIPT_VERSION="1.1.2"
+SCRIPT_DESCRIPTION="A bulletproof backup tool for your home folder with smart exclusions"
 SCRIPT_AUTHOR="Wael Isa"
 SCRIPT_WEBSITE="https://www.wael.name"
 SCRIPT_GITHUB="https://github.com/waelisa/home-backup"
@@ -79,8 +88,10 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 BACKUP_SOURCE="$HOME"
 BACKUP_DEST="$SCRIPT_DIR/Backups"
 LOGS_DIR="$SCRIPT_DIR/Logs"
+INTEGRITY_DIR="$SCRIPT_DIR/Integrity"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 LOG_FILE="$LOGS_DIR/backup_$TIMESTAMP.log"
+INTEGRITY_LOG="$INTEGRITY_DIR/integrity_$TIMESTAMP.log"
 MAX_BACKUPS=2  # Keep only this many most recent backups
 MIN_FREE_SPACE=1024  # Minimum free space in MB (1GB = 1024MB)
 EMERGENCY_THRESHOLD=512  # Emergency threshold in MB (0.5GB)
@@ -89,6 +100,8 @@ EMERGENCY_THRESHOLD=512  # Emergency threshold in MB (0.5GB)
 PERFORMANCE_MODE="safe"  # safe, fast, turbo
 ENABLE_ENCRYPTION=false
 ENABLE_VERIFICATION=false
+ENABLE_INTEGRITY=false  # Separate integrity verification (SHA256)
+ENABLE_AUTO_EJECT=false
 ENABLE_EMAIL_NOTIFY=false
 EMAIL_ADDRESS=""
 BANDWIDTH_LIMIT=0  # 0 = unlimited, in KB/s
@@ -122,6 +135,174 @@ send_email() {
     fi
 }
 
+# Function to safely eject USB drive
+do_eject() {
+    local eject_requested=$1
+    local cron_mode=$2
+
+    # Only proceed if destination is a USB drive
+    local mount_type=$(detect_mount_type)
+    if [ "$mount_type" != "usb" ]; then
+        return 0
+    fi
+
+    # Get mount point and device
+    local mount_point=$(df -P "$BACKUP_DEST" 2>/dev/null | tail -1 | awk '{print $6}')
+    local device=$(findmnt -n -o SOURCE --target "$BACKUP_DEST" 2>/dev/null)
+
+    if [ -z "$device" ] || [ -z "$mount_point" ]; then
+        return 0
+    fi
+
+    # Check if auto-eject is enabled or user requested it
+    if [ "$ENABLE_AUTO_EJECT" = true ] || [ "$eject_requested" = true ]; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${YELLOW}🔌 Preparing to eject backup drive...${NC}"
+        fi
+
+        # Sync to ensure all data is written
+        sync
+
+        # Try to unmount and power off using udisksctl
+        if command -v udisksctl &> /dev/null; then
+            if udisksctl unmount -b "$device" &>/dev/null; then
+                # Power off the drive (optional, may not be supported on all systems)
+                udisksctl power-off -b "$device" &>/dev/null
+
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${GREEN}✅ Drive safely ejected from $mount_point${NC}"
+                    send_notification "Drive Ejected" "Your backup drive has been safely unmounted." "drive-removable-media"
+                fi
+
+                # Log the ejection
+                echo "$(date): Backup drive safely ejected from $mount_point" >> "$LOG_FILE"
+                return 0
+            else
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${RED}❌ Failed to eject drive. It may be in use.${NC}"
+                fi
+                echo "$(date): Failed to eject drive from $mount_point - device busy" >> "$LOG_FILE"
+                return 1
+            fi
+        else
+            # Fallback to umount if udisksctl not available
+            if umount "$mount_point" &>/dev/null; then
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${GREEN}✅ Drive unmounted from $mount_point${NC}"
+                    echo -e "${YELLOW}⚠️  It's now safe to unplug the drive.${NC}"
+                fi
+                echo "$(date): Drive unmounted from $mount_point" >> "$LOG_FILE"
+                return 0
+            else
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${RED}❌ Failed to unmount drive. It may be in use.${NC}"
+                fi
+                echo "$(date): Failed to unmount drive from $mount_point" >> "$LOG_FILE"
+                return 1
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Function to verify integrity of critical folders using SHA256
+verify_integrity() {
+    local backup_path="$1"
+    local source_path="$BACKUP_SOURCE"
+    local cron_mode=$2
+
+    if [ "$ENABLE_INTEGRITY" != true ] && [ "$ENABLE_VERIFICATION" != true ]; then
+        return 0
+    fi
+
+    if ! is_cron_mode "$cron_mode"; then
+        echo -e "${BLUE}🔍 Running integrity verification (SHA256)...${NC}"
+    fi
+
+    # Create integrity directory if it doesn't exist
+    mkdir -p "$INTEGRITY_DIR"
+
+    # Define critical folders to verify (can be customized)
+    local critical_folders=(
+        "Documents"
+        "Pictures"
+        "Videos"
+        "Music"
+        "Desktop"
+        "Projects"
+    )
+
+    local verified_count=0
+    local failed_count=0
+
+    # Start integrity log
+    echo "Integrity Verification - $(date)" > "$INTEGRITY_LOG"
+    echo "Source: $source_path" >> "$INTEGRITY_LOG"
+    echo "Backup: $backup_path" >> "$INTEGRITY_LOG"
+    echo "========================================" >> "$INTEGRITY_LOG"
+
+    for folder in "${critical_folders[@]}"; do
+        local source_folder="$source_path/$folder"
+        local backup_folder="$backup_path/$folder"
+
+        if [ -d "$source_folder" ] && [ -d "$backup_folder" ]; then
+            if ! is_cron_mode "$cron_mode"; then
+                echo -e "${BLUE}  📁 Verifying $folder...${NC}"
+            fi
+
+            # Generate checksums for source (only if they don't exist or are older than 1 day)
+            local source_checksum_file="$INTEGRITY_DIR/${folder}_source.sha256"
+            local backup_checksum_file="$INTEGRITY_DIR/${folder}_backup.sha256"
+
+            # Source checksums (refresh if older than 1 day or doesn't exist)
+            if [ ! -f "$source_checksum_file" ] || [ $(find "$source_checksum_file" -mtime +1) ]; then
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${YELLOW}    Generating source checksums...${NC}"
+                fi
+                find "$source_folder" -type f -exec sha256sum {} \; > "$source_checksum_file" 2>/dev/null
+            fi
+
+            # Backup checksums
+            find "$backup_folder" -type f -exec sha256sum {} \; > "$backup_checksum_file" 2>/dev/null
+
+            # Compare checksums
+            if diff -q "$source_checksum_file" "$backup_checksum_file" &>/dev/null; then
+                echo "✅ $folder: OK" >> "$INTEGRITY_LOG"
+                ((verified_count++))
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${GREEN}    ✅ $folder verified${NC}"
+                fi
+            else
+                # Find mismatches
+                local mismatches=$(comm -23 <(sort "$source_checksum_file" | cut -d' ' -f1) <(sort "$backup_checksum_file" | cut -d' ' -f1) | wc -l)
+                echo "⚠️  $folder: $mismatches files differ" >> "$INTEGRITY_LOG"
+                ((failed_count++))
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${YELLOW}    ⚠️  $folder: $mismatches files differ${NC}"
+                fi
+            fi
+        fi
+    done
+
+    echo "========================================" >> "$INTEGRITY_LOG"
+    echo "Verified: $verified_count folders, Issues: $failed_count folders" >> "$INTEGRITY_LOG"
+
+    if ! is_cron_mode "$cron_mode"; then
+        if [ $failed_count -eq 0 ]; then
+            echo -e "${GREEN}✅ Integrity verification complete - All OK${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Integrity verification complete - $failed_count folders have issues${NC}"
+        fi
+        echo -e "${BLUE}📋 Integrity log: $INTEGRITY_LOG${NC}"
+    fi
+
+    # Send email notification if there were issues
+    if [ $failed_count -gt 0 ] && [ "$ENABLE_EMAIL_NOTIFY" = true ]; then
+        send_email "Integrity Verification Issues" "Found issues in $failed_count folders. Check log: $INTEGRITY_LOG"
+    fi
+}
+
 # Function to encrypt backup (for cloud storage)
 encrypt_backup() {
     local backup_path="$1"
@@ -143,33 +324,46 @@ encrypt_backup() {
     fi
 }
 
-# Function to verify backup integrity
+# Function to verify backup integrity (quick check)
 verify_backup() {
     local backup_path="$1"
     local source_path="$BACKUP_SOURCE"
+    local cron_mode=$2
 
     if [ "$ENABLE_VERIFICATION" = true ]; then
-        echo -e "${BLUE}🔍 Verifying backup integrity...${NC}"
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${BLUE}🔍 Verifying backup integrity...${NC}"
+        fi
 
         # Quick verification - check file counts
         local source_files=$(find "$source_path" -type f ! -path "*/.*" 2>/dev/null | wc -l)
         local backup_files=$(find "$backup_path" -type f 2>/dev/null | wc -l)
 
         if [ "$source_files" -eq "$backup_files" ]; then
-            echo -e "${GREEN}✅ File count matches ($source_files files)${NC}"
+            if ! is_cron_mode "$cron_mode"; then
+                echo -e "${GREEN}✅ File count matches ($source_files files)${NC}"
+            fi
 
             # Optional: checksum verification (slow but thorough)
             if [ "$PERFORMANCE_MODE" != "turbo" ]; then
-                echo -e "${BLUE}📊 Running checksum verification (this may take a while)...${NC}"
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${BLUE}📊 Running checksum verification (this may take a while)...${NC}"
+                fi
                 local mismatches=$(rsync -avc --dry-run "$source_path/" "$backup_path/" 2>/dev/null | grep -c "^<" || true)
                 if [ "$mismatches" -eq 0 ]; then
-                    echo -e "${GREEN}✅ All files verified (checksums match)${NC}"
+                    if ! is_cron_mode "$cron_mode"; then
+                        echo -e "${GREEN}✅ All files verified (checksums match)${NC}"
+                    fi
                 else
-                    echo -e "${YELLOW}⚠️  Found $mismatches files with mismatched checksums${NC}"
+                    if ! is_cron_mode "$cron_mode"; then
+                        echo -e "${YELLOW}⚠️  Found $mismatches files with mismatched checksums${NC}"
+                    fi
                 fi
             fi
         else
-            echo -e "${YELLOW}⚠️  File count mismatch: Source=$source_files, Backup=$backup_files${NC}"
+            if ! is_cron_mode "$cron_mode"; then
+                echo -e "${YELLOW}⚠️  File count mismatch: Source=$source_files, Backup=$backup_files${NC}"
+            fi
         fi
     fi
 }
@@ -246,6 +440,8 @@ ${GREEN}OPTIONS:${NC}
   ${YELLOW}--mode [safe|fast|turbo]${NC}  Set performance mode
   ${YELLOW}--encrypt${NC}             Enable backup encryption
   ${YELLOW}--verify${NC}              Enable backup verification
+  ${YELLOW}--integrity${NC}           Enable SHA256 integrity verification
+  ${YELLOW}--auto-eject${NC}          Auto-eject USB drive after backup
   ${YELLOW}--email [address]${NC}     Enable email notifications
   ${YELLOW}--bwlimit [KB/s]${NC}      Set bandwidth limit
   ${YELLOW}--generate-config${NC}     Generate a sample config file
@@ -255,18 +451,20 @@ ${GREEN}PERFORMANCE MODES:${NC}
   ${CYAN}fast${NC}   - Uses --inplace for SSD speed, skips checksums (faster)
   ${CYAN}turbo${NC}  - Uses --inplace and --no-whole-file (fastest, riskier)
 
+${GREEN}SECURITY FEATURES:${NC}
+  ${CYAN}auto-eject${NC}   - Safely unmounts USB drives after backup
+  ${CYAN}integrity${NC}    - SHA256 checksums for critical folders
+  ${CYAN}encryption${NC}   - GPG encryption for cloud backups
+
 ${GREEN}EXAMPLES:${NC}
-  ${BLUE}# Run with safe mode (default)${NC}
-  $(basename "$0") --backup
+  ${BLUE}# Run with safe mode and auto-eject${NC}
+  $(basename "$0") --mode safe --auto-eject --backup
 
-  ${BLUE}# Run with turbo mode for maximum speed${NC}
-  $(basename "$0") --mode turbo --backup
+  ${BLUE}# Run with integrity verification${NC}
+  $(basename "$0") --integrity --backup
 
-  ${BLUE}# Run with encryption and verification${NC}
-  $(basename "$0") --encrypt --verify --backup
-
-  ${BLUE}# Run with bandwidth limit (for network backups)${NC}
-  $(basename "$0") --bwlimit 1024 --backup
+  ${BLUE}# Run with auto-eject for USB drives${NC}
+  $(basename "$0") --auto-eject --backup
 
   ${BLUE}# Generate sample config file${NC}
   $(basename "$0") --generate-config
@@ -276,13 +474,13 @@ ${GREEN}STORAGE NOTES:${NC}
   ${PURPLE}• Actual space used is much less! Run: du -sh $BACKUP_DEST${NC}
   ${PURPLE}• Two backups typically take space of one + changes${NC}
   ${PURPLE}• The 'latest' symlink always points to the last SUCCESSFUL backup${NC}
-  ${PURPLE}• Turbo mode is 30-50% faster but slightly riskier${NC}
 
 ${GREEN}FOLDERS:${NC}
-  ${CYAN}Script:${NC}  $SCRIPT_DIR
-  ${CYAN}Backups:${NC} $BACKUP_DEST
-  ${CYAN}Logs:   ${NC} $LOGS_DIR
-  ${CYAN}Config:${NC}  $SCRIPT_DIR/backup.conf
+  ${CYAN}Script:${NC}    $SCRIPT_DIR
+  ${CYAN}Backups:${NC}   $BACKUP_DEST
+  ${CYAN}Logs:${NC}      $LOGS_DIR
+  ${CYAN}Integrity:${NC} $INTEGRITY_DIR
+  ${CYAN}Config:${NC}    $SCRIPT_DIR/backup.conf
 
 ${GREEN}LICENSE:${NC} MIT
 EOF
@@ -300,6 +498,8 @@ show_version() {
     echo "Performance Mode: $PERFORMANCE_MODE"
     echo "Encryption: $([ "$ENABLE_ENCRYPTION" = true ] && echo "Enabled" || echo "Disabled")"
     echo "Verification: $([ "$ENABLE_VERIFICATION" = true ] && echo "Enabled" || echo "Disabled")"
+    echo "Integrity: $([ "$ENABLE_INTEGRITY" = true ] && echo "Enabled" || echo "Disabled")"
+    echo "Auto-Eject: $([ "$ENABLE_AUTO_EJECT" = true ] && echo "Enabled" || echo "Disabled")"
     echo "Email Notify: $([ "$ENABLE_EMAIL_NOTIFY" = true ] && echo "Enabled" || echo "Disabled")"
     echo "Bandwidth Limit: $([ "$BANDWIDTH_LIMIT" -gt 0 ] && echo "${BANDWIDTH_LIMIT} KB/s" || echo "Unlimited")"
     exit 0
@@ -342,6 +542,14 @@ ENABLE_ENCRYPTION=false
 # Set to true to verify backup integrity after completion
 ENABLE_VERIFICATION=false
 
+# Integrity Verification (SHA256)
+# Set to true to run SHA256 checksums on critical folders
+ENABLE_INTEGRITY=false
+
+# Auto-Eject
+# Set to true to automatically eject USB drives after backup
+ENABLE_AUTO_EJECT=false
+
 # Email Notifications (for cron jobs)
 # Set to true and provide email address to get notifications
 ENABLE_EMAIL_NOTIFY=false
@@ -359,6 +567,17 @@ MIN_FREE_SPACE=1024
 
 # Emergency threshold in MB (backup will be blocked)
 EMERGENCY_THRESHOLD=512
+
+# Critical folders for integrity verification (space-separated)
+# These folders will have SHA256 checksums verified
+CRITICAL_FOLDERS=(
+    "Documents"
+    "Pictures"
+    "Videos"
+    "Music"
+    "Desktop"
+    "Projects"
+)
 
 # Custom exclude patterns (one per line, uses rsync syntax)
 # These will be added to the automatically generated exclusions
@@ -496,6 +715,9 @@ show_mount_info() {
         usb)
             echo -e "  💾 Type: ${PURPLE}USB Drive${NC}"
             echo -e "  🔌 Status: ${GREEN}Connected${NC}"
+            if [ "$ENABLE_AUTO_EJECT" = true ]; then
+                echo -e "  🔌 Auto-Eject: ${GREEN}Enabled${NC}"
+            fi
             ;;
         network)
             echo -e "  🌐 Type: ${PURPLE}Network Mount${NC} ($fs_type)"
@@ -565,6 +787,7 @@ print_header() {
     echo -e "${CYAN}║${NC}  GitHub: $SCRIPT_GITHUB                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  Build Date: $SCRIPT_BUILD_DATE                                                                   ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  Performance Mode: ${PURPLE}$PERFORMANCE_MODE${NC}                                                        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  Auto-Eject: ${PURPLE}$([ "$ENABLE_AUTO_EJECT" = true ] && echo "Enabled" || echo "Disabled")${NC}                                                     ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -845,6 +1068,29 @@ cleanup_old_logs() {
                 if [ -z "$cron_mode" ]; then
                     echo -e "  ${RED}🗑️  Removing log: $(basename "$old_log") ($log_size)${NC}"
                 fi
+                rm -f "$old_log"
+            fi
+        done
+    fi
+}
+
+# Function to clean up old integrity logs (keeps last 5)
+cleanup_old_integrity() {
+    local integrity_logs=()
+    local cron_mode=$1
+
+    # Get all integrity log files sorted by date (newest first)
+    while IFS= read -r -d '' log; do
+        integrity_logs+=("$log")
+    done < <(find "$INTEGRITY_DIR" -maxdepth 1 -type f -name "integrity_*.log" -print0 | sort -rz)
+
+    local total_logs=${#integrity_logs[@]}
+    local max_logs=5  # Keep last 5 integrity logs
+
+    if [ $total_logs -gt $max_logs ]; then
+        for ((i=$max_logs; i<$total_logs; i++)); do
+            local old_log="${integrity_logs[$i]}"
+            if [ -f "$old_log" ]; then
                 rm -f "$old_log"
             fi
         done
@@ -1413,6 +1659,15 @@ check_dependencies() {
         fi
     fi
 
+    # Check for udisksctl (for auto-eject)
+    if [ "$ENABLE_AUTO_EJECT" = true ] && ! command -v udisksctl &> /dev/null; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "  ${YELLOW}⚠${NC} udisksctl not found (auto-eject disabled)"
+            echo -e "     Install udisks2 for auto-eject support"
+        fi
+        ENABLE_AUTO_EJECT=false
+    fi
+
     # Check for numfmt (coreutils)
     if ! command -v numfmt &> /dev/null; then
         if ! is_cron_mode "$cron_mode"; then
@@ -1433,6 +1688,15 @@ check_dependencies() {
         if ! is_cron_mode "$cron_mode"; then
             echo -e "  ${GREEN}✓${NC} stat found"
         fi
+    fi
+
+    # Check for sha256sum (for integrity verification)
+    if [ "$ENABLE_INTEGRITY" = true ] && ! command -v sha256sum &> /dev/null; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "  ${YELLOW}⚠${NC} sha256sum not found (integrity verification disabled)"
+            echo -e "     Install coreutils for sha256sum"
+        fi
+        ENABLE_INTEGRITY=false
     fi
 
     # Check for curl/wget (for internet searches)
@@ -1495,6 +1759,9 @@ check_dependencies() {
                 sudo apt install -y "$dep"
             done
             # Install optional packages
+            if [ "$ENABLE_AUTO_EJECT" = true ]; then
+                sudo apt install -y udisks2
+            fi
             if [ "$ENABLE_ENCRYPTION" = true ]; then
                 sudo apt install -y gnupg
             fi
@@ -1512,6 +1779,9 @@ check_dependencies() {
                 sudo pacman -S --noconfirm "$dep"
             done
             # Install optional packages
+            if [ "$ENABLE_AUTO_EJECT" = true ]; then
+                sudo pacman -S --noconfirm udisks2
+            fi
             if [ "$ENABLE_ENCRYPTION" = true ]; then
                 sudo pacman -S --noconfirm gnupg
             fi
@@ -1540,6 +1810,9 @@ gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
                 sudo dnf install -y "$dep"
             done
             # Install optional packages
+            if [ "$ENABLE_AUTO_EJECT" = true ]; then
+                sudo dnf install -y udisks2
+            fi
             if [ "$ENABLE_ENCRYPTION" = true ]; then
                 sudo dnf install -y gnupg
             fi
@@ -1604,7 +1877,7 @@ show_exclusions_table() {
     fi
 }
 
-# Function to perform backup with style (now with performance tuning)
+# Function to perform backup with style (now with auto-eject)
 do_backup() {
     local dry_run_flag=""
     local operation_title="💾  BACKUP OPERATION"
@@ -1870,7 +2143,12 @@ do_backup() {
 
             # Verify backup if enabled
             if [ "$ENABLE_VERIFICATION" = true ]; then
-                verify_backup "$backup_path"
+                verify_backup "$backup_path" "$cron_mode"
+            fi
+
+            # Run integrity verification if enabled
+            if [ "$ENABLE_INTEGRITY" = true ]; then
+                verify_integrity "$backup_path" "$cron_mode"
             fi
 
             # Encrypt backup if enabled
@@ -1930,6 +2208,29 @@ do_backup() {
             cleanup_old_backups "$cron_mode"
             # Clean up old logs
             cleanup_old_logs "$cron_mode"
+            # Clean up old integrity logs
+            cleanup_old_integrity "$cron_mode"
+
+            # Auto-eject if enabled and on USB drive
+            if [ "$ENABLE_AUTO_EJECT" = true ] && [ "$mount_type" = "usb" ]; then
+                if is_cron_mode "$cron_mode"; then
+                    # In cron mode, auto-eject without prompting
+                    do_eject true "$cron_mode"
+                else
+                    # In interactive mode, ask user
+                    if command -v gum &> /dev/null; then
+                        if gum confirm "Backup complete. Eject drive safely?"; then
+                            do_eject true "$cron_mode"
+                        fi
+                    else
+                        echo -e "${YELLOW}Eject drive safely? (y/n)${NC}"
+                        read -r eject_confirm
+                        if [[ "$eject_confirm" =~ ^[Yy]$ ]]; then
+                            do_eject true "$cron_mode"
+                        fi
+                    fi
+                fi
+            fi
         else
             # Dry run success message
             if ! is_cron_mode "$cron_mode"; then
@@ -2016,6 +2317,8 @@ show_destination_info() {
         echo -e "  • Mode: ${CYAN}$PERFORMANCE_MODE${NC}"
         echo -e "  • Encryption: ${CYAN}$([ "$ENABLE_ENCRYPTION" = true ] && echo "Enabled" || echo "Disabled")${NC}"
         echo -e "  • Verification: ${CYAN}$([ "$ENABLE_VERIFICATION" = true ] && echo "Enabled" || echo "Disabled")${NC}"
+        echo -e "  • Integrity: ${CYAN}$([ "$ENABLE_INTEGRITY" = true ] && echo "Enabled" || echo "Disabled")${NC}"
+        echo -e "  • Auto-Eject: ${CYAN}$([ "$ENABLE_AUTO_EJECT" = true ] && echo "Enabled" || echo "Disabled")${NC}"
         echo -e "  • Bandwidth Limit: ${CYAN}$([ "$BANDWIDTH_LIMIT" -gt 0 ] && echo "${BANDWIDTH_LIMIT} KB/s" || echo "Unlimited")${NC}"
     else
         echo -e "${RED}❌ Destination is NOT accessible!${NC}"
@@ -2218,6 +2521,7 @@ show_status() {
             gum style --padding "0 2" --italic --foreground 226 "       to see the real physical space consumption."
             gum style --padding "0 2" --italic --foreground 46  "       The 'latest' symlink always points to the last SUCCESSFUL backup."
             gum style --padding "0 2" --italic --foreground 99  "       Current performance mode: $PERFORMANCE_MODE"
+            gum style --padding "0 2" --italic --foreground 99  "       Auto-Eject: $([ "$ENABLE_AUTO_EJECT" = true ] && echo "Enabled" || echo "Disabled")"
         else
             echo -e "\n${YELLOW}💾 STORAGE EXPLANATION:${NC}"
             echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -2233,6 +2537,7 @@ show_status() {
             echo -e "       to see the real physical space consumption.${NC}"
             echo -e "${GREEN}       The 'latest' symlink always points to the last SUCCESSFUL backup.${NC}"
             echo -e "${PURPLE}       Current performance mode: $PERFORMANCE_MODE${NC}"
+            echo -e "${PURPLE}       Auto-Eject: $([ "$ENABLE_AUTO_EJECT" = true ] && echo "Enabled" || echo "Disabled")${NC}"
         fi
     fi
 
@@ -2244,6 +2549,17 @@ show_status() {
             gum style --padding "1 2" --foreground 99 "📋 Logs: $log_count files, $log_size total"
         else
             echo -e "\n${PURPLE}📋 Logs: $log_count files, $log_size total${NC}"
+        fi
+    fi
+
+    # Show integrity directory info
+    if [ -d "$INTEGRITY_DIR" ]; then
+        local integrity_count=$(find "$INTEGRITY_DIR" -type f -name "integrity_*.log" 2>/dev/null | wc -l)
+        local integrity_size=$(du -sh "$INTEGRITY_DIR" 2>/dev/null | cut -f1)
+        if command -v gum &> /dev/null; then
+            gum style --padding "1 2" --foreground 99 "🔍 Integrity Logs: $integrity_count files, $integrity_size total"
+        else
+            echo -e "\n${PURPLE}🔍 Integrity Logs: $integrity_count files, $integrity_size total${NC}"
         fi
     fi
 
@@ -2508,6 +2824,7 @@ do_cleanup() {
     # Perform cleanup
     cleanup_old_backups
     cleanup_old_logs
+    cleanup_old_integrity
 
     if command -v gum &> /dev/null; then
         gum style --foreground 46 "✅ Cleanup complete!"
@@ -2672,7 +2989,7 @@ setup_scheduling() {
             echo ""
             echo -e "${YELLOW}⚠️  Note: You're backing up to a USB drive.${NC}"
             echo -e "${YELLOW}   For cron jobs to work, the drive must be mounted at backup time.${NC}"
-            echo -e "${YELLOW}   Consider using a permanently mounted drive for automated backups.${NC}"
+            echo -e "${YELLOW}   Consider enabling auto-eject if you want to safely remove the drive.${NC}"
         fi
     fi
 
@@ -2682,263 +2999,6 @@ setup_scheduling() {
     else
         echo -e "\n${BLUE}Press Enter to continue...${NC}"
         read -r
-    fi
-}
-
-# Main menu with gum
-show_menu() {
-    if command -v gum &> /dev/null; then
-        clear
-        # Fancy header
-        gum style \
-            --border thick \
-            --margin "1" \
-            --padding "1 2" \
-            --border-foreground 212 \
-            --foreground 226 \
-            "🏠  $SCRIPT_NAME v$SCRIPT_VERSION" \
-            "" \
-            "Universal backup tool - works anywhere (USB, network, local)"
-
-        # Show script location warning if needed
-        if [[ "$SCRIPT_DIR" == "$HOME"* ]]; then
-            gum style \
-                --padding "0 2" \
-                --foreground 196 \
-                "⚠️  WARNING: Script running from home folder!"
-        fi
-
-        # Show mount type in menu
-        local mount_type=$(detect_mount_type)
-        case "$mount_type" in
-            usb)
-                gum style \
-                    --padding "0 2" \
-                    --foreground 46 \
-                    "💾 Destination: USB Drive"
-                ;;
-            network)
-                gum style \
-                    --padding "0 2" \
-                    --foreground 99 \
-                    "🌐 Destination: Network Mount"
-                ;;
-            different_device)
-                gum style \
-                    --padding "0 2" \
-                    --foreground 46 \
-                    "💿 Destination: Different Device (optimal)"
-                ;;
-            same_device)
-                gum style \
-                    --padding "0 2" \
-                    --foreground 226 \
-                    "⚠️  Destination: Same Device (not recommended)"
-                ;;
-        esac
-
-        # Show performance mode
-        gum style \
-            --padding "0 2" \
-            --foreground 99 \
-            "⚡ Performance Mode: $PERFORMANCE_MODE"
-
-        # Show disk space warning if needed
-        local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
-        if [ ! -z "$free_space_mb" ]; then
-            if [ $free_space_mb -lt $EMERGENCY_THRESHOLD ]; then
-                gum style \
-                    --padding "0 2" \
-                    --foreground 196 \
-                    "🔴 CRITICAL: Emergency low disk space!"
-            elif [ $free_space_mb -lt $MIN_FREE_SPACE ]; then
-                gum style \
-                    --padding "0 2" \
-                    --foreground 226 \
-                    "🟡 Warning: Low disk space"
-            fi
-        fi
-
-        # Show backup status in menu
-        if [ -d "$BACKUP_DEST/latest" ]; then
-            latest=$(readlink -f "$BACKUP_DEST/latest")
-            latest_size=$(du -sh "$latest" 2>/dev/null | cut -f1)
-            latest_date=$(basename "$latest" | sed "s/$(basename "$BACKUP_SOURCE")_//")
-
-            # Determine if it's incremental
-            local backups=()
-            while IFS= read -r -d '' backup; do
-                backups+=("$backup")
-            done < <(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" -print0 | sort -r)
-
-            if [ ${#backups[@]} -gt 1 ] && [ "${backups[0]}" = "$latest" ]; then
-                gum style \
-                    --padding "0 2" \
-                    --foreground 46 \
-                    "✅ Latest: $latest_date [$latest_size] (Incremental)"
-            else
-                gum style \
-                    --padding "0 2" \
-                    --foreground 46 \
-                    "✅ Latest: $latest_date [$latest_size]"
-            fi
-        else
-            gum style \
-                --padding "0 2" \
-                --foreground 196 \
-                "❌ No backups found"
-        fi
-
-        # Show backup count
-        local backup_count=$(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" 2>/dev/null | wc -l)
-        gum style \
-            --padding "0 2" \
-            --foreground 226 \
-            "📚 Keeping last $MAX_BACKUPS backups (${backup_count} total)"
-
-        # Show log count
-        local log_count=$(find "$LOGS_DIR" -maxdepth 1 -type f -name "backup_*.log" 2>/dev/null | wc -l)
-        gum style \
-            --padding "0 2" \
-            --foreground 99 \
-            "📋 Logs: $log_count available"
-
-        # Main menu
-        choice=$(gum choose \
-            --header="Select operation:" \
-            --cursor="👉 " \
-            --cursor.foreground="212" \
-            --selected.foreground="212" \
-            --height=15 \
-            "💾 Create Backup (Incremental)" \
-            "🔍 Dry Run (Preview)" \
-            "♻️  Restore Backup" \
-            "📊 View Status" \
-            "📋 View Logs" \
-            "🔍 Update Exclusions" \
-            "🧹 Cleanup Old Backups" \
-            "⏰ Schedule Automatic Backups" \
-            "⚡ Change Performance Mode" \
-            "🖥️  Create Desktop Shortcut" \
-            "ℹ️  Destination Info" \
-            "❌ Exit")
-
-        case $choice in
-            "💾 Create Backup (Incremental)")
-                do_backup
-                ;;
-            "🔍 Dry Run (Preview)")
-                do_backup "dry"
-                ;;
-            "♻️  Restore Backup")
-                do_restore
-                ;;
-            "📊 View Status")
-                show_status
-                ;;
-            "📋 View Logs")
-                view_logs
-                ;;
-            "🔍 Update Exclusions")
-                update_exclusions
-                ;;
-            "🧹 Cleanup Old Backups")
-                do_cleanup
-                ;;
-            "⏰ Schedule Automatic Backups")
-                setup_scheduling
-                ;;
-            "⚡ Change Performance Mode")
-                change_performance_mode
-                ;;
-            "🖥️  Create Desktop Shortcut")
-                create_desktop_shortcut
-                ;;
-            "ℹ️  Destination Info")
-                show_destination_info
-                ;;
-            "❌ Exit")
-                clear
-                gum style --foreground 212 "Goodbye! 👋"
-                exit 0
-                ;;
-        esac
-    else
-        # Fallback menu without gum
-        while true; do
-            print_header
-
-            # Show script location warning
-            check_script_location
-            echo ""
-
-            # Show mount information
-            show_mount_info
-
-            echo -e "${GREEN}1.${NC} 💾 Create Backup (Incremental)"
-            echo -e "${GREEN}2.${NC} 🔍 Dry Run (Preview)"
-            echo -e "${GREEN}3.${NC} ♻️  Restore Backup"
-            echo -e "${GREEN}4.${NC} 📊 View Status"
-            echo -e "${GREEN}5.${NC} 📋 View Logs"
-            echo -e "${GREEN}6.${NC} 🔍 Update Exclusions"
-            echo -e "${GREEN}7.${NC} 🧹 Cleanup Old Backups"
-            echo -e "${GREEN}8.${NC} ⏰ Schedule Automatic Backups"
-            echo -e "${GREEN}9.${NC} ⚡ Change Performance Mode"
-            echo -e "${GREEN}10.${NC} 🖥️  Create Desktop Shortcut"
-            echo -e "${GREEN}11.${NC} ℹ️  Destination Info"
-            echo -e "${GREEN}12.${NC} ❌ Exit"
-            echo ""
-
-            # Show disk space warning
-            local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
-            if [ ! -z "$free_space_mb" ]; then
-                if [ $free_space_mb -lt $EMERGENCY_THRESHOLD ]; then
-                    echo -e "${RED}🔴 CRITICAL: Emergency low disk space!${NC}"
-                elif [ $free_space_mb -lt $MIN_FREE_SPACE ]; then
-                    echo -e "${YELLOW}🟡 Warning: Low disk space${NC}"
-                fi
-            fi
-
-            # Show backup count
-            local backup_count=$(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" 2>/dev/null | wc -l)
-            echo -e "${YELLOW}Backups: $backup_count / $MAX_BACKUPS kept${NC}"
-
-            # Show log count
-            local log_count=$(find "$LOGS_DIR" -maxdepth 1 -type f -name "backup_*.log" 2>/dev/null | wc -l)
-            echo -e "${PURPLE}Logs: $log_count available${NC}"
-
-            if [ -d "$BACKUP_DEST/latest" ]; then
-                latest_size=$(du -sh "$BACKUP_DEST/latest" 2>/dev/null | cut -f1)
-                echo -e "${GREEN}Latest: $latest_size${NC}"
-            fi
-
-            echo ""
-            echo -e "${YELLOW}Choice [1-12]:${NC}"
-            read -r choice
-
-            case $choice in
-                1) do_backup ;;
-                2) do_backup "dry" ;;
-                3) do_restore ;;
-                4) show_status ;;
-                5) view_logs ;;
-                6) update_exclusions ;;
-                7) do_cleanup ;;
-                8) setup_scheduling ;;
-                9) change_performance_mode ;;
-                10) create_desktop_shortcut ;;
-                11) show_destination_info ;;
-                12)
-                    clear
-                    echo -e "${GREEN}Goodbye! 👋${NC}"
-                    exit 0
-                    ;;
-                *)
-                    echo -e "${RED}Invalid choice${NC}"
-                    sleep 1
-                    ;;
-            esac
-        done
     fi
 }
 
@@ -3027,6 +3087,317 @@ change_performance_mode() {
     sleep 2
 }
 
+# Function to toggle auto-eject
+toggle_auto_eject() {
+    if [ "$ENABLE_AUTO_EJECT" = true ]; then
+        ENABLE_AUTO_EJECT=false
+        echo -e "${YELLOW}⚠️ Auto-eject disabled${NC}"
+    else
+        if command -v udisksctl &> /dev/null; then
+            ENABLE_AUTO_EJECT=true
+            echo -e "${GREEN}✅ Auto-eject enabled${NC}"
+        else
+            echo -e "${RED}❌ udisksctl not found. Install udisks2 for auto-eject support.${NC}"
+        fi
+    fi
+
+    # Optionally save to config
+    if command -v gum &> /dev/null; then
+        if gum confirm "Save to config file?"; then
+            if [ -f "$CONFIG_FILE" ]; then
+                sed -i "s/ENABLE_AUTO_EJECT=.*/ENABLE_AUTO_EJECT=$ENABLE_AUTO_EJECT/" "$CONFIG_FILE"
+            else
+                echo "ENABLE_AUTO_EJECT=$ENABLE_AUTO_EJECT" > "$CONFIG_FILE"
+            fi
+            echo -e "${GREEN}✅ Saved to config file${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Save to config file? (y/n)${NC}"
+        read -r save_config
+        if [[ "$save_config" =~ ^[Yy]$ ]]; then
+            if [ -f "$CONFIG_FILE" ]; then
+                sed -i "s/ENABLE_AUTO_EJECT=.*/ENABLE_AUTO_EJECT=$ENABLE_AUTO_EJECT/" "$CONFIG_FILE"
+            else
+                echo "ENABLE_AUTO_EJECT=$ENABLE_AUTO_EJECT" > "$CONFIG_FILE"
+            fi
+            echo -e "${GREEN}✅ Saved to config file${NC}"
+        fi
+    fi
+
+    sleep 2
+}
+
+# Main menu with gum
+show_menu() {
+    if command -v gum &> /dev/null; then
+        clear
+        # Fancy header
+        gum style \
+            --border thick \
+            --margin "1" \
+            --padding "1 2" \
+            --border-foreground 212 \
+            --foreground 226 \
+            "🏠  $SCRIPT_NAME v$SCRIPT_VERSION" \
+            "" \
+            "Bulletproof backup tool - works anywhere (USB, network, local)"
+
+        # Show script location warning if needed
+        if [[ "$SCRIPT_DIR" == "$HOME"* ]]; then
+            gum style \
+                --padding "0 2" \
+                --foreground 196 \
+                "⚠️  WARNING: Script running from home folder!"
+        fi
+
+        # Show mount type in menu
+        local mount_type=$(detect_mount_type)
+        case "$mount_type" in
+            usb)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 46 \
+                    "💾 Destination: USB Drive"
+                ;;
+            network)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 99 \
+                    "🌐 Destination: Network Mount"
+                ;;
+            different_device)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 46 \
+                    "💿 Destination: Different Device (optimal)"
+                ;;
+            same_device)
+                gum style \
+                    --padding "0 2" \
+                    --foreground 226 \
+                    "⚠️  Destination: Same Device (not recommended)"
+                ;;
+        esac
+
+        # Show performance mode
+        gum style \
+            --padding "0 2" \
+            --foreground 99 \
+            "⚡ Performance Mode: $PERFORMANCE_MODE"
+
+        # Show auto-eject status
+        if [ "$mount_type" = "usb" ]; then
+            gum style \
+                --padding "0 2" \
+                --foreground $([ "$ENABLE_AUTO_EJECT" = true ] && echo "46" || echo "226") \
+                "🔌 Auto-Eject: $([ "$ENABLE_AUTO_EJECT" = true ] && echo "Enabled" || echo "Disabled")"
+        fi
+
+        # Show disk space warning if needed
+        local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
+        if [ ! -z "$free_space_mb" ]; then
+            if [ $free_space_mb -lt $EMERGENCY_THRESHOLD ]; then
+                gum style \
+                    --padding "0 2" \
+                    --foreground 196 \
+                    "🔴 CRITICAL: Emergency low disk space!"
+            elif [ $free_space_mb -lt $MIN_FREE_SPACE ]; then
+                gum style \
+                    --padding "0 2" \
+                    --foreground 226 \
+                    "🟡 Warning: Low disk space"
+            fi
+        fi
+
+        # Show backup status in menu
+        if [ -d "$BACKUP_DEST/latest" ]; then
+            latest=$(readlink -f "$BACKUP_DEST/latest")
+            latest_size=$(du -sh "$latest" 2>/dev/null | cut -f1)
+            latest_date=$(basename "$latest" | sed "s/$(basename "$BACKUP_SOURCE")_//")
+
+            # Determine if it's incremental
+            local backups=()
+            while IFS= read -r -d '' backup; do
+                backups+=("$backup")
+            done < <(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" -print0 | sort -r)
+
+            if [ ${#backups[@]} -gt 1 ] && [ "${backups[0]}" = "$latest" ]; then
+                gum style \
+                    --padding "0 2" \
+                    --foreground 46 \
+                    "✅ Latest: $latest_date [$latest_size] (Incremental)"
+            else
+                gum style \
+                    --padding "0 2" \
+                    --foreground 46 \
+                    "✅ Latest: $latest_date [$latest_size]"
+            fi
+        else
+            gum style \
+                --padding "0 2" \
+                --foreground 196 \
+                "❌ No backups found"
+        fi
+
+        # Show backup count
+        local backup_count=$(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" 2>/dev/null | wc -l)
+        gum style \
+            --padding "0 2" \
+            --foreground 226 \
+            "📚 Keeping last $MAX_BACKUPS backups (${backup_count} total)"
+
+        # Show log count
+        local log_count=$(find "$LOGS_DIR" -maxdepth 1 -type f -name "backup_*.log" 2>/dev/null | wc -l)
+        gum style \
+            --padding "0 2" \
+            --foreground 99 \
+            "📋 Logs: $log_count available"
+
+        # Main menu
+        choice=$(gum choose \
+            --header="Select operation:" \
+            --cursor="👉 " \
+            --cursor.foreground="212" \
+            --selected.foreground="212" \
+            --height=17 \
+            "💾 Create Backup (Incremental)" \
+            "🔍 Dry Run (Preview)" \
+            "♻️  Restore Backup" \
+            "📊 View Status" \
+            "📋 View Logs" \
+            "🔍 Update Exclusions" \
+            "🧹 Cleanup Old Backups" \
+            "⏰ Schedule Automatic Backups" \
+            "⚡ Change Performance Mode" \
+            "🔌 Toggle Auto-Eject" \
+            "🖥️  Create Desktop Shortcut" \
+            "ℹ️  Destination Info" \
+            "❌ Exit")
+
+        case $choice in
+            "💾 Create Backup (Incremental)")
+                do_backup
+                ;;
+            "🔍 Dry Run (Preview)")
+                do_backup "dry"
+                ;;
+            "♻️  Restore Backup")
+                do_restore
+                ;;
+            "📊 View Status")
+                show_status
+                ;;
+            "📋 View Logs")
+                view_logs
+                ;;
+            "🔍 Update Exclusions")
+                update_exclusions
+                ;;
+            "🧹 Cleanup Old Backups")
+                do_cleanup
+                ;;
+            "⏰ Schedule Automatic Backups")
+                setup_scheduling
+                ;;
+            "⚡ Change Performance Mode")
+                change_performance_mode
+                ;;
+            "🔌 Toggle Auto-Eject")
+                toggle_auto_eject
+                ;;
+            "🖥️  Create Desktop Shortcut")
+                create_desktop_shortcut
+                ;;
+            "ℹ️  Destination Info")
+                show_destination_info
+                ;;
+            "❌ Exit")
+                clear
+                gum style --foreground 212 "Goodbye! 👋"
+                exit 0
+                ;;
+        esac
+    else
+        # Fallback menu without gum
+        while true; do
+            print_header
+
+            # Show script location warning
+            check_script_location
+            echo ""
+
+            # Show mount information
+            show_mount_info
+
+            echo -e "${GREEN}1.${NC} 💾 Create Backup (Incremental)"
+            echo -e "${GREEN}2.${NC} 🔍 Dry Run (Preview)"
+            echo -e "${GREEN}3.${NC} ♻️  Restore Backup"
+            echo -e "${GREEN}4.${NC} 📊 View Status"
+            echo -e "${GREEN}5.${NC} 📋 View Logs"
+            echo -e "${GREEN}6.${NC} 🔍 Update Exclusions"
+            echo -e "${GREEN}7.${NC} 🧹 Cleanup Old Backups"
+            echo -e "${GREEN}8.${NC} ⏰ Schedule Automatic Backups"
+            echo -e "${GREEN}9.${NC} ⚡ Change Performance Mode"
+            echo -e "${GREEN}10.${NC} 🔌 Toggle Auto-Eject"
+            echo -e "${GREEN}11.${NC} 🖥️  Create Desktop Shortcut"
+            echo -e "${GREEN}12.${NC} ℹ️  Destination Info"
+            echo -e "${GREEN}13.${NC} ❌ Exit"
+            echo ""
+
+            # Show disk space warning
+            local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
+            if [ ! -z "$free_space_mb" ]; then
+                if [ $free_space_mb -lt $EMERGENCY_THRESHOLD ]; then
+                    echo -e "${RED}🔴 CRITICAL: Emergency low disk space!${NC}"
+                elif [ $free_space_mb -lt $MIN_FREE_SPACE ]; then
+                    echo -e "${YELLOW}🟡 Warning: Low disk space${NC}"
+                fi
+            fi
+
+            # Show backup count
+            local backup_count=$(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" 2>/dev/null | wc -l)
+            echo -e "${YELLOW}Backups: $backup_count / $MAX_BACKUPS kept${NC}"
+
+            # Show log count
+            local log_count=$(find "$LOGS_DIR" -maxdepth 1 -type f -name "backup_*.log" 2>/dev/null | wc -l)
+            echo -e "${PURPLE}Logs: $log_count available${NC}"
+
+            if [ -d "$BACKUP_DEST/latest" ]; then
+                latest_size=$(du -sh "$BACKUP_DEST/latest" 2>/dev/null | cut -f1)
+                echo -e "${GREEN}Latest: $latest_size${NC}"
+            fi
+
+            echo ""
+            echo -e "${YELLOW}Choice [1-13]:${NC}"
+            read -r choice
+
+            case $choice in
+                1) do_backup ;;
+                2) do_backup "dry" ;;
+                3) do_restore ;;
+                4) show_status ;;
+                5) view_logs ;;
+                6) update_exclusions ;;
+                7) do_cleanup ;;
+                8) setup_scheduling ;;
+                9) change_performance_mode ;;
+                10) toggle_auto_eject ;;
+                11) create_desktop_shortcut ;;
+                12) show_destination_info ;;
+                13)
+                    clear
+                    echo -e "${GREEN}Goodbye! 👋${NC}"
+                    exit 0
+                    ;;
+                *)
+                    echo -e "${RED}Invalid choice${NC}"
+                    sleep 1
+                    ;;
+            esac
+        done
+    fi
+}
+
 # Parse command line arguments
 parse_arguments() {
     case "$1" in
@@ -3087,6 +3458,14 @@ parse_arguments() {
             ENABLE_VERIFICATION=true
             echo -e "${GREEN}✅ Verification enabled${NC}"
             ;;
+        --integrity)
+            ENABLE_INTEGRITY=true
+            echo -e "${GREEN}✅ Integrity verification enabled${NC}"
+            ;;
+        --auto-eject)
+            ENABLE_AUTO_EJECT=true
+            echo -e "${GREEN}✅ Auto-eject enabled${NC}"
+            ;;
         --email)
             if [ -n "$2" ]; then
                 ENABLE_EMAIL_NOTIFY=true
@@ -3135,10 +3514,12 @@ main() {
     # Create necessary directories
     mkdir -p "$BACKUP_DEST"
     mkdir -p "$LOGS_DIR"
+    mkdir -p "$INTEGRITY_DIR"
 
     echo -e "${GREEN}✅ Directories ready:${NC}"
     echo -e "  📁 Backups: $BACKUP_DEST"
     echo -e "  📋 Logs:    $LOGS_DIR"
+    echo -e "  🔍 Integrity: $INTEGRITY_DIR"
     sleep 1
 
     # Initial exclusion generation if needed
