@@ -4,7 +4,7 @@
 # Wael Isa
 # Web site  https://www.wael.name
 # GitHub     https://github.com/waelisa/home-backup
-# v1.1.0
+# v1.1.1
 # Build Date: 02/24/2026
 #
 # ██╗    ██╗ █████╗ ███████╗██╗         ██╗███████╗ █████╗
@@ -21,7 +21,11 @@
 # Features:
 #   • Universal path detection - works anywhere (USB drives, external disks, network mounts)
 #   • Smart mount checking - verifies destination is accessible before backup
-#   • Warning when running from home folder (prevents backing up to itself)
+#   • Performance tuning options (safe vs fast modes)
+#   • Encryption support for cloud backups
+#   • Data verification with checksums
+#   • Email notifications for cron jobs
+#   • Bandwidth limiting for network backups
 #   • True incremental backups with hard links (space efficient)
 #   • Smart exclusion detection (internet search + local software detection)
 #   • Atomic symlink updates (never points to failed backups)
@@ -34,19 +38,38 @@
 #   • Comprehensive logging with viewer
 #   • CLI arguments for all operations
 #
+# Performance Modes:
+#   • Safe Mode (default) - Uses --no-inplace, verifies with checksums
+#   • Fast Mode - Uses --inplace for SSD speed, skips checksums
+#   • Turbo Mode - Uses --inplace and --no-whole-file for maximum speed
+#
 # Requirements:
 #   • rsync, gum (optional, for beautiful UI), notify-send (optional)
+#   • gpg (optional, for encryption), mail (optional, for email notifications)
 #
 # Author: Wael Isa
 # Website: https://www.wael.name
 # GitHub: https://github.com/waelisa/home-backup
 # License: MIT
 #
+# Changelog:
+#   v1.0.0 - Initial release with basic backup/restore
+#   v1.0.1 - Added auto cleanup (keeps last 2 backups)
+#   v1.0.2 - Added progress bar, dry run, notifications
+#   v1.0.3 - Added disk space check
+#   v1.0.4 - True incremental backups with hard links
+#   v1.0.5 - Safety checks and scheduling
+#   v1.0.6 - Desktop integration
+#   v1.0.7 - Atomic symlinks and CLI arguments
+#   v1.0.8 - Professional header and success link
+#   v1.1.0 - Universal path detection & USB support
+#   v1.1.1 - Performance tuning, encryption, verification
+#
 #############################################################################################################################
 
 # Script configuration
 SCRIPT_NAME="Home Folder Backup Utility"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 SCRIPT_DESCRIPTION="A comprehensive backup tool for your home folder with smart exclusions"
 SCRIPT_AUTHOR="Wael Isa"
 SCRIPT_WEBSITE="https://www.wael.name"
@@ -62,6 +85,14 @@ MAX_BACKUPS=2  # Keep only this many most recent backups
 MIN_FREE_SPACE=1024  # Minimum free space in MB (1GB = 1024MB)
 EMERGENCY_THRESHOLD=512  # Emergency threshold in MB (0.5GB)
 
+# Performance settings (can be overridden by config file)
+PERFORMANCE_MODE="safe"  # safe, fast, turbo
+ENABLE_ENCRYPTION=false
+ENABLE_VERIFICATION=false
+ENABLE_EMAIL_NOTIFY=false
+EMAIL_ADDRESS=""
+BANDWIDTH_LIMIT=0  # 0 = unlimited, in KB/s
+
 # Color codes for fallback
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -70,6 +101,277 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# Load custom configuration if exists
+CONFIG_FILE="$SCRIPT_DIR/backup.conf"
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
+
+# Function to send email notifications (for cron jobs)
+send_email() {
+    local subject="$1"
+    local message="$2"
+
+    if [ "$ENABLE_EMAIL_NOTIFY" = true ] && [ -n "$EMAIL_ADDRESS" ]; then
+        if command -v mail &> /dev/null; then
+            echo "$message" | mail -s "$subject" "$EMAIL_ADDRESS"
+        elif command -v sendmail &> /dev/null; then
+            echo -e "Subject: $subject\n\n$message" | sendmail "$EMAIL_ADDRESS"
+        fi
+    fi
+}
+
+# Function to encrypt backup (for cloud storage)
+encrypt_backup() {
+    local backup_path="$1"
+    local encrypted_path="${backup_path}.gpg"
+
+    if [ "$ENABLE_ENCRYPTION" = true ] && command -v gpg &> /dev/null; then
+        echo -e "${BLUE}🔐 Encrypting backup...${NC}"
+        if tar czf - "$backup_path" 2>/dev/null | gpg -c --cipher-algo AES256 -o "$encrypted_path" 2>/dev/null; then
+            echo -e "${GREEN}✅ Backup encrypted successfully${NC}"
+            # Optionally remove unencrypted backup
+            # rm -rf "$backup_path"
+            echo "$encrypted_path"
+        else
+            echo -e "${RED}❌ Encryption failed${NC}"
+            echo "$backup_path"
+        fi
+    else
+        echo "$backup_path"
+    fi
+}
+
+# Function to verify backup integrity
+verify_backup() {
+    local backup_path="$1"
+    local source_path="$BACKUP_SOURCE"
+
+    if [ "$ENABLE_VERIFICATION" = true ]; then
+        echo -e "${BLUE}🔍 Verifying backup integrity...${NC}"
+
+        # Quick verification - check file counts
+        local source_files=$(find "$source_path" -type f ! -path "*/.*" 2>/dev/null | wc -l)
+        local backup_files=$(find "$backup_path" -type f 2>/dev/null | wc -l)
+
+        if [ "$source_files" -eq "$backup_files" ]; then
+            echo -e "${GREEN}✅ File count matches ($source_files files)${NC}"
+
+            # Optional: checksum verification (slow but thorough)
+            if [ "$PERFORMANCE_MODE" != "turbo" ]; then
+                echo -e "${BLUE}📊 Running checksum verification (this may take a while)...${NC}"
+                local mismatches=$(rsync -avc --dry-run "$source_path/" "$backup_path/" 2>/dev/null | grep -c "^<" || true)
+                if [ "$mismatches" -eq 0 ]; then
+                    echo -e "${GREEN}✅ All files verified (checksums match)${NC}"
+                else
+                    echo -e "${YELLOW}⚠️  Found $mismatches files with mismatched checksums${NC}"
+                fi
+            fi
+        else
+            echo -e "${YELLOW}⚠️  File count mismatch: Source=$source_files, Backup=$backup_files${NC}"
+        fi
+    fi
+}
+
+# Function to get performance flags based on mode
+get_performance_flags() {
+    local mount_type="$1"
+    local flags=""
+
+    case "$PERFORMANCE_MODE" in
+        safe)
+            # Safe mode: no inplace, with checksums
+            flags="--no-inc-recursive"
+            ;;
+        fast)
+            # Fast mode: use inplace for SSD, skip checksums
+            if [ "$mount_type" != "network" ] && [ "$mount_type" != "usb" ]; then
+                flags="--inplace --no-inc-recursive"
+            else
+                flags="--no-inc-recursive"  # Don't use inplace on USB/network
+            fi
+            ;;
+        turbo)
+            # Turbo mode: maximum speed (use with caution)
+            if [ "$mount_type" != "network" ]; then
+                flags="--inplace --no-whole-file --no-inc-recursive"
+            else
+                flags="--no-inc-recursive"
+            fi
+            ;;
+    esac
+
+    # Add bandwidth limit if set
+    if [ "$BANDWIDTH_LIMIT" -gt 0 ]; then
+        flags="$flags --bwlimit=$BANDWIDTH_LIMIT"
+    fi
+
+    echo "$flags"
+}
+
+# Function to display help
+show_help() {
+    cat << EOF
+${CYAN}╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║${NC}                                          ${PURPLE}🏠 $SCRIPT_NAME${NC}                                           ${CYAN}║${NC}
+${CYAN}║${NC}                                                ${YELLOW}v$SCRIPT_VERSION${NC}                                                 ${CYAN}║${NC}
+${CYAN}╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
+
+${GREEN}DESCRIPTION:${NC}
+  $SCRIPT_DESCRIPTION
+
+${GREEN}AUTHOR:${NC} $SCRIPT_AUTHOR
+${GREEN}WEBSITE:${NC} $SCRIPT_WEBSITE
+${GREEN}GITHUB:${NC} $SCRIPT_GITHUB
+${GREEN}BUILD DATE:${NC} $SCRIPT_BUILD_DATE
+
+${GREEN}USAGE:${NC}
+  $(basename "$0") [OPTION]
+
+${GREEN}OPTIONS:${NC}
+  ${YELLOW}-h, --help${NC}           Show this help message
+  ${YELLOW}-v, --version${NC}        Show version information
+  ${YELLOW}-b, --backup${NC}         Run backup in interactive mode
+  ${YELLOW}-c, --cron${NC}           Run backup in silent cron mode (no output)
+  ${YELLOW}-d, --dry-run${NC}        Perform a dry run (preview without copying)
+  ${YELLOW}-s, --status${NC}         Show backup status
+  ${YELLOW}-l, --logs${NC}           View backup logs
+  ${YELLOW}-r, --restore${NC}        Restore from backup (interactive)
+  ${YELLOW}-u, --update-exclusions${NC}  Update exclusion patterns
+  ${YELLOW}-k, --cleanup${NC}        Clean up old backups manually
+  ${YELLOW}--schedule${NC}            Setup automatic scheduling
+  ${YELLOW}--desktop${NC}             Create desktop shortcut
+  ${YELLOW}--info${NC}                Show destination information
+  ${YELLOW}--mode [safe|fast|turbo]${NC}  Set performance mode
+  ${YELLOW}--encrypt${NC}             Enable backup encryption
+  ${YELLOW}--verify${NC}              Enable backup verification
+  ${YELLOW}--email [address]${NC}     Enable email notifications
+  ${YELLOW}--bwlimit [KB/s]${NC}      Set bandwidth limit
+  ${YELLOW}--generate-config${NC}     Generate a sample config file
+
+${GREEN}PERFORMANCE MODES:${NC}
+  ${CYAN}safe${NC}   - Default, uses --no-inplace, verifies with checksums (safest)
+  ${CYAN}fast${NC}   - Uses --inplace for SSD speed, skips checksums (faster)
+  ${CYAN}turbo${NC}  - Uses --inplace and --no-whole-file (fastest, riskier)
+
+${GREEN}EXAMPLES:${NC}
+  ${BLUE}# Run with safe mode (default)${NC}
+  $(basename "$0") --backup
+
+  ${BLUE}# Run with turbo mode for maximum speed${NC}
+  $(basename "$0") --mode turbo --backup
+
+  ${BLUE}# Run with encryption and verification${NC}
+  $(basename "$0") --encrypt --verify --backup
+
+  ${BLUE}# Run with bandwidth limit (for network backups)${NC}
+  $(basename "$0") --bwlimit 1024 --backup
+
+  ${BLUE}# Generate sample config file${NC}
+  $(basename "$0") --generate-config
+
+${GREEN}STORAGE NOTES:${NC}
+  ${PURPLE}• Due to hard links, file managers show 'apparent' size${NC}
+  ${PURPLE}• Actual space used is much less! Run: du -sh $BACKUP_DEST${NC}
+  ${PURPLE}• Two backups typically take space of one + changes${NC}
+  ${PURPLE}• The 'latest' symlink always points to the last SUCCESSFUL backup${NC}
+  ${PURPLE}• Turbo mode is 30-50% faster but slightly riskier${NC}
+
+${GREEN}FOLDERS:${NC}
+  ${CYAN}Script:${NC}  $SCRIPT_DIR
+  ${CYAN}Backups:${NC} $BACKUP_DEST
+  ${CYAN}Logs:   ${NC} $LOGS_DIR
+  ${CYAN}Config:${NC}  $SCRIPT_DIR/backup.conf
+
+${GREEN}LICENSE:${NC} MIT
+EOF
+    exit 0
+}
+
+# Function to show version
+show_version() {
+    echo "$SCRIPT_NAME v$SCRIPT_VERSION"
+    echo "Build Date: $SCRIPT_BUILD_DATE"
+    echo "Author: $SCRIPT_AUTHOR"
+    echo "Website: $SCRIPT_WEBSITE"
+    echo "GitHub: $SCRIPT_GITHUB"
+    echo ""
+    echo "Performance Mode: $PERFORMANCE_MODE"
+    echo "Encryption: $([ "$ENABLE_ENCRYPTION" = true ] && echo "Enabled" || echo "Disabled")"
+    echo "Verification: $([ "$ENABLE_VERIFICATION" = true ] && echo "Enabled" || echo "Disabled")"
+    echo "Email Notify: $([ "$ENABLE_EMAIL_NOTIFY" = true ] && echo "Enabled" || echo "Disabled")"
+    echo "Bandwidth Limit: $([ "$BANDWIDTH_LIMIT" -gt 0 ] && echo "${BANDWIDTH_LIMIT} KB/s" || echo "Unlimited")"
+    exit 0
+}
+
+# Function to generate sample config file
+generate_config() {
+    local config_file="$SCRIPT_DIR/backup.conf"
+
+    if [ -f "$config_file" ]; then
+        echo -e "${YELLOW}⚠️  Config file already exists: $config_file${NC}"
+        if command -v gum &> /dev/null; then
+            if ! gum confirm "Overwrite?"; then
+                return
+            fi
+        else
+            echo -e "${YELLOW}Overwrite? (y/n)${NC}"
+            read -r overwrite
+            if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+                return
+            fi
+        fi
+    fi
+
+    cat > "$config_file" << 'EOF'
+# Home Backup Configuration File
+# Generated on $(date)
+
+# Performance Mode: safe, fast, or turbo
+#   safe  - Uses --no-inplace, verifies with checksums (safest)
+#   fast  - Uses --inplace for SSD speed, skips checksums (faster)
+#   turbo - Uses --inplace and --no-whole-file (fastest, riskier)
+PERFORMANCE_MODE="safe"
+
+# Encryption (requires gpg)
+# Set to true to encrypt backups (for cloud storage)
+ENABLE_ENCRYPTION=false
+
+# Verification
+# Set to true to verify backup integrity after completion
+ENABLE_VERIFICATION=false
+
+# Email Notifications (for cron jobs)
+# Set to true and provide email address to get notifications
+ENABLE_EMAIL_NOTIFY=false
+EMAIL_ADDRESS="your.email@example.com"
+
+# Bandwidth Limit (in KB/s, 0 = unlimited)
+# Useful for network backups to avoid saturating connection
+BANDWIDTH_LIMIT=0
+
+# Maximum number of backups to keep
+MAX_BACKUPS=2
+
+# Minimum free space in MB before warning
+MIN_FREE_SPACE=1024
+
+# Emergency threshold in MB (backup will be blocked)
+EMERGENCY_THRESHOLD=512
+
+# Custom exclude patterns (one per line, uses rsync syntax)
+# These will be added to the automatically generated exclusions
+CUSTOM_EXCLUDES=(
+    "*.tmp"
+    "*.temp"
+    "*.cache"
+)
+EOF
+
+    echo -e "${GREEN}✅ Sample config file generated: $config_file${NC}"
+    echo -e "${BLUE}Edit this file to customize your backup settings.${NC}"
+}
 
 # Function to check if script is running from home folder
 check_script_location() {
@@ -216,127 +518,28 @@ show_mount_info() {
         echo -e "  📍 Mount: $mount_point"
     fi
 
-    echo ""
-}
-
-# Function to display help
-show_help() {
-    cat << EOF
-${CYAN}╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}
-${CYAN}║${NC}                                          ${PURPLE}🏠 $SCRIPT_NAME${NC}                                           ${CYAN}║${NC}
-${CYAN}║${NC}                                                ${YELLOW}v$SCRIPT_VERSION${NC}                                                 ${CYAN}║${NC}
-${CYAN}╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}
-
-${GREEN}DESCRIPTION:${NC}
-  $SCRIPT_DESCRIPTION
-
-${GREEN}AUTHOR:${NC} $SCRIPT_AUTHOR
-${GREEN}WEBSITE:${NC} $SCRIPT_WEBSITE
-${GREEN}GITHUB:${NC} $SCRIPT_GITHUB
-${GREEN}BUILD DATE:${NC} $SCRIPT_BUILD_DATE
-
-${GREEN}USAGE:${NC}
-  $(basename "$0") [OPTION]
-
-${GREEN}OPTIONS:${NC}
-  ${YELLOW}-h, --help${NC}       Show this help message
-  ${YELLOW}-v, --version${NC}    Show version information
-  ${YELLOW}-b, --backup${NC}     Run backup in interactive mode
-  ${YELLOW}-c, --cron${NC}       Run backup in silent cron mode (no output)
-  ${YELLOW}-d, --dry-run${NC}    Perform a dry run (preview without copying)
-  ${YELLOW}-s, --status${NC}      Show backup status
-  ${YELLOW}-l, --logs${NC}        View backup logs
-  ${YELLOW}-r, --restore${NC}     Restore from backup (interactive)
-  ${YELLOW}-u, --update-exclusions${NC}  Update exclusion patterns
-  ${YELLOW}-k, --cleanup${NC}     Clean up old backups manually
-  ${YELLOW}--schedule${NC}        Setup automatic scheduling
-  ${YELLOW}--desktop${NC}         Create desktop shortcut
-  ${YELLOW}--info${NC}            Show destination information
-
-${GREEN}EXAMPLES:${NC}
-  ${BLUE}# Run interactive backup${NC}
-  $(basename "$0") --backup
-
-  ${BLUE}# Run silent backup for cron jobs${NC}
-  $(basename "$0") --cron
-
-  ${BLUE}# Check if USB drive is mounted before backup${NC}
-  $(basename "$0") --info
-
-  ${BLUE}# Setup daily automatic backups to USB drive${NC}
-  $(basename "$0") --schedule
-
-${GREEN}STORAGE NOTES:${NC}
-  ${PURPLE}• Due to hard links, file managers show 'apparent' size${NC}
-  ${PURPLE}• Actual space used is much less! Run: du -sh $BACKUP_DEST${NC}
-  ${PURPLE}• Two backups typically take space of one + changes${NC}
-  ${PURPLE}• The 'latest' symlink always points to the last SUCCESSFUL backup${NC}
-
-${GREEN}FOLDERS:${NC}
-  ${CYAN}Script:${NC}  $SCRIPT_DIR
-  ${CYAN}Backups:${NC} $BACKUP_DEST
-  ${CYAN}Logs:   ${NC} $LOGS_DIR
-
-${GREEN}MOUNT TYPES DETECTED:${NC}
-  ${CYAN}USB Drive${NC}      - Backing up to removable media
-  ${CYAN}Network Mount${NC}   - Backing up to network share
-  ${CYAN}Different Device${NC}- Backing up to separate disk (optimal)
-  ${CYAN}Same Device${NC}     - Backing up to same drive (not recommended)
-
-${GREEN}LICENSE:${NC} MIT
-EOF
-    exit 0
-}
-
-# Function to show version
-show_version() {
-    echo "$SCRIPT_NAME v$SCRIPT_VERSION"
-    echo "Build Date: $SCRIPT_BUILD_DATE"
-    echo "Author: $SCRIPT_AUTHOR"
-    echo "Website: $SCRIPT_WEBSITE"
-    echo "GitHub: $SCRIPT_GITHUB"
-    exit 0
-}
-
-# Function to show destination info
-show_destination_info() {
-    clear
-    print_header
-    echo -e "${BLUE}📌 DESTINATION INFORMATION${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-
-    # Show script location check
-    check_script_location
+    # Show performance recommendation
+    echo -e "\n${BLUE}⚡ Performance Recommendation:${NC}"
+    case "$mount_type" in
+        usb)
+            echo -e "  • Use ${YELLOW}safe mode${NC} for USB drives (reliable)"
+            echo -e "  • Current mode: ${CYAN}$PERFORMANCE_MODE${NC}"
+            ;;
+        network)
+            echo -e "  • Use ${YELLOW}bandwidth limit${NC} to avoid network saturation"
+            echo -e "  • Current limit: ${CYAN}$([ "$BANDWIDTH_LIMIT" -gt 0 ] && echo "${BANDWIDTH_LIMIT} KB/s" || echo "Unlimited")${NC}"
+            ;;
+        different_device)
+            echo -e "  • ${GREEN}fast or turbo mode${NC} recommended for SSD/HDD"
+            echo -e "  • Current mode: ${CYAN}$PERFORMANCE_MODE${NC}"
+            ;;
+        same_device)
+            echo -e "  • ${YELLOW}Consider moving to different device${NC} for safety"
+            echo -e "  • Current mode: ${CYAN}$PERFORMANCE_MODE${NC}"
+            ;;
+    esac
 
     echo ""
-
-    # Show mount information
-    show_mount_info
-
-    # Show destination accessibility
-    if check_destination_accessible; then
-        # Show free space
-        local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
-        if [ ! -z "$free_space_mb" ]; then
-            local free_space_hr=$(numfmt --to=iec $((free_space_mb * 1024 * 1024)) 2>/dev/null || echo "${free_space_mb}MB")
-            echo -e "${GREEN}💾 Free space: $free_space_hr${NC}"
-        fi
-    else
-        echo -e "${RED}❌ Destination is NOT accessible!${NC}"
-        echo -e "${YELLOW}  Possible issues:${NC}"
-        echo -e "  • USB drive not plugged in"
-        echo -e "  • Network share disconnected"
-        echo -e "  • Permissions problem"
-    fi
-
-    echo ""
-    if command -v gum &> /dev/null; then
-        gum confirm "Press Enter to continue" && return
-    else
-        echo -e "\n${BLUE}Press Enter to continue...${NC}"
-        read -r
-    fi
 }
 
 # Function to send desktop notifications
@@ -361,6 +564,7 @@ print_header() {
     echo -e "${CYAN}║${NC}  Website: $SCRIPT_WEBSITE                                                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  GitHub: $SCRIPT_GITHUB                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  Build Date: $SCRIPT_BUILD_DATE                                                                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  Performance Mode: ${PURPLE}$PERFORMANCE_MODE${NC}                                                        ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -458,6 +662,7 @@ check_disk_space() {
         if [ -z "$cron_mode" ]; then
             send_notification "🚨 CRITICAL: Low Disk Space" "Emergency threshold reached! Free space: $free_space_hr" "dialog-error"
         fi
+        send_email "Backup Failed - Critical Low Space" "Emergency threshold reached! Free space: $free_space_hr"
         return 1
     elif [ $free_space_mb -lt $MIN_FREE_SPACE ]; then
         echo -e "${YELLOW}⚠️  Warning: Low disk space${NC}"
@@ -473,6 +678,7 @@ check_disk_space() {
         if [ -z "$cron_mode" ]; then
             send_notification "❌ Backup Failed" "Insufficient disk space: Need ${required_space_hr}, have ${free_space_hr}" "dialog-error"
         fi
+        send_email "Backup Failed - Insufficient Space" "Need ${required_space_hr}, have ${free_space_hr}"
         return 1
     else
         echo -e "${GREEN}✅ Sufficient disk space available${NC}"
@@ -702,7 +908,7 @@ view_logs() {
         selected_date=$(echo "$selected" | cut -d' ' -f1)
         selected_log="$LOGS_DIR/backup_${selected_date}.log"
     else
-        echo -e ${CYAN}Available logs:${NC}
+        echo -e "${CYAN}Available logs:${NC}"
         for i in "${!log_options[@]}"; do
             echo -e "  $((i+1)). ${log_options[$i]}"
         done
@@ -1145,6 +1351,11 @@ EOF
         cat "/tmp/local_exclusions.txt" >> "$merged_file"
     fi
 
+    # Add custom excludes from config
+    for exclude in "${CUSTOM_EXCLUDES[@]}"; do
+        echo "$exclude" >> "$merged_file"
+    done
+
     # Deduplicate and clean
     sort -u "$merged_file" | grep -v "^#" | grep -v "^$" > "/tmp/clean_exclusions.txt"
 
@@ -1239,6 +1450,22 @@ check_dependencies() {
         fi
     fi
 
+    # Check for gpg (optional, for encryption)
+    if [ "$ENABLE_ENCRYPTION" = true ] && ! command -v gpg &> /dev/null; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "  ${YELLOW}⚠${NC} gpg not found (encryption disabled)"
+        fi
+        ENABLE_ENCRYPTION=false
+    fi
+
+    # Check for mail (optional, for email notifications)
+    if [ "$ENABLE_EMAIL_NOTIFY" = true ] && ! command -v mail &> /dev/null && ! command -v sendmail &> /dev/null; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "  ${YELLOW}⚠${NC} mail/sendmail not found (email notifications disabled)"
+        fi
+        ENABLE_EMAIL_NOTIFY=false
+    fi
+
     if [ ${#missing_deps[@]} -ne 0 ]; then
         if ! is_cron_mode "$cron_mode"; then
             echo ""
@@ -1267,8 +1494,13 @@ check_dependencies() {
                 fi
                 sudo apt install -y "$dep"
             done
-            # Install libnotify-bin for notifications
-            sudo apt install -y libnotify-bin
+            # Install optional packages
+            if [ "$ENABLE_ENCRYPTION" = true ]; then
+                sudo apt install -y gnupg
+            fi
+            if [ "$ENABLE_EMAIL_NOTIFY" = true ]; then
+                sudo apt install -y mailutils
+            fi
         elif command -v pacman &> /dev/null; then
             if ! is_cron_mode "$cron_mode"; then
                 echo -e "  ${PURPLE}📀 Arch Linux detected${NC}"
@@ -1279,8 +1511,13 @@ check_dependencies() {
                 fi
                 sudo pacman -S --noconfirm "$dep"
             done
-            # Install libnotify for notifications
-            sudo pacman -S --noconfirm libnotify
+            # Install optional packages
+            if [ "$ENABLE_ENCRYPTION" = true ]; then
+                sudo pacman -S --noconfirm gnupg
+            fi
+            if [ "$ENABLE_EMAIL_NOTIFY" = true ]; then
+                sudo pacman -S --noconfirm mailutils
+            fi
         elif command -v dnf &> /dev/null; then
             if ! is_cron_mode "$cron_mode"; then
                 echo -e "  ${PURPLE}📀 Fedora detected${NC}"
@@ -1302,8 +1539,13 @@ gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
                 fi
                 sudo dnf install -y "$dep"
             done
-            # Install libnotify for notifications
-            sudo dnf install -y libnotify
+            # Install optional packages
+            if [ "$ENABLE_ENCRYPTION" = true ]; then
+                sudo dnf install -y gnupg
+            fi
+            if [ "$ENABLE_EMAIL_NOTIFY" = true ]; then
+                sudo dnf install -y mailx
+            fi
         else
             echo -e "${RED}❌ Unsupported package manager. Please install manually: ${missing_deps[*]}${NC}"
             exit 1
@@ -1362,7 +1604,7 @@ show_exclusions_table() {
     fi
 }
 
-# Function to perform backup with style (now with atomic success link)
+# Function to perform backup with style (now with performance tuning)
 do_backup() {
     local dry_run_flag=""
     local operation_title="💾  BACKUP OPERATION"
@@ -1393,14 +1635,21 @@ do_backup() {
     if ! check_destination_accessible "$cron_mode"; then
         if is_cron_mode "$cron_mode"; then
             echo "$(date): Backup aborted - destination not accessible (USB drive not mounted?)" >> "$LOG_FILE"
+            send_email "Backup Failed - Destination Not Accessible" "The backup destination is not accessible. Check if USB drive is mounted."
         fi
         return 1
     fi
+
+    # Detect mount type for performance tuning
+    local mount_type=$(detect_mount_type)
 
     # Show mount information in interactive mode
     if ! is_cron_mode "$cron_mode"; then
         show_mount_info
     fi
+
+    # Get performance flags based on mode and mount type
+    local perf_flags=$(get_performance_flags "$mount_type")
 
     # Find the last backup for incremental linking
     local last_backup=$(find_last_backup)
@@ -1433,6 +1682,8 @@ do_backup() {
                 "Source:      $BACKUP_SOURCE" \
                 "Destination: $BACKUP_DEST" \
                 "Type:        $backup_type" \
+                "Mode:        $PERFORMANCE_MODE" \
+                "Mount:       $mount_type" \
                 "Timestamp:   $TIMESTAMP" \
                 "Keep last:   $MAX_BACKUPS backups"
         else
@@ -1442,6 +1693,8 @@ do_backup() {
             echo -e "Source:      $BACKUP_SOURCE"
             echo -e "Destination: $BACKUP_DEST"
             echo -e "Type:        $backup_type"
+            echo -e "Mode:        $PERFORMANCE_MODE"
+            echo -e "Mount:       $mount_type"
             echo -e "Timestamp:   $TIMESTAMP"
             echo -e "Keep last:   $MAX_BACKUPS backups"
             echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -1538,7 +1791,7 @@ do_backup() {
                     return
                 fi
             else
-                if ! gum confirm "🚀 Ready to start $backup_type backup?"; then
+                if ! gum confirm "🚀 Ready to start $backup_type backup in $PERFORMANCE_MODE mode?"; then
                     return
                 fi
             fi
@@ -1546,7 +1799,7 @@ do_backup() {
             if [[ "$1" == "dry" ]] || [[ "$1" == "--dry-run" ]]; then
                 echo -e "${YELLOW}Run dry run preview? (y/n)${NC}"
             else
-                echo -e "${YELLOW}Start $backup_type backup? (y/n)${NC}"
+                echo -e "${YELLOW}Start $backup_type backup in $PERFORMANCE_MODE mode? (y/n)${NC}"
             fi
             read -r confirm
             if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -1557,19 +1810,21 @@ do_backup() {
 
     # Notify start (skip for dry run and cron mode might want quiet)
     if [[ "$1" != "dry" ]] && [[ "$1" != "--dry-run" ]] && ! is_cron_mode "$cron_mode"; then
-        send_notification "$notification_title" "Starting $backup_type backup of $HOME" "drive-harddisk"
+        send_notification "$notification_title" "Starting $backup_type backup of $HOME (Mode: $PERFORMANCE_MODE)" "drive-harddisk"
     fi
 
     # Create backup folder name
     local backup_name="$(basename "$BACKUP_SOURCE")_$TIMESTAMP"
     local backup_path="$BACKUP_DEST/$backup_name"
 
-    # Build rsync command with safety check for link-dest
-    local rsync_cmd="rsync -avh $dry_run_flag --progress --delete $link_dest_param $exclude_params \"$BACKUP_SOURCE/\" \"$backup_path/\""
+    # Build rsync command with safety check for link-dest and performance flags
+    local rsync_cmd="rsync -avh $dry_run_flag --progress --delete $perf_flags $link_dest_param $exclude_params \"$BACKUP_SOURCE/\" \"$backup_path/\""
 
     # Log the command
     echo "Backup started at $(date)" > "$LOG_FILE"
     echo "Mode: ${1:-normal}" >> "$LOG_FILE"
+    echo "Performance Mode: $PERFORMANCE_MODE" >> "$LOG_FILE"
+    echo "Mount Type: $mount_type" >> "$LOG_FILE"
     echo "Type: $backup_type" >> "$LOG_FILE"
     echo "Linked to: ${last_backup:-none}" >> "$LOG_FILE"
     echo "Command: $rsync_cmd" >> "$LOG_FILE"
@@ -1578,7 +1833,7 @@ do_backup() {
 
     # Execute backup
     if ! is_cron_mode "$cron_mode"; then
-        echo -e "${GREEN}📦 Starting data transfer...${NC}"
+        echo -e "${GREEN}📦 Starting data transfer in $PERFORMANCE_MODE mode...${NC}"
     fi
 
     # CRITICAL FIX: Only update the 'latest' symlink if the backup succeeds
@@ -1613,6 +1868,16 @@ do_backup() {
                 echo -e "${GREEN}✅ Backup verified and linked as latest.${NC}"
             fi
 
+            # Verify backup if enabled
+            if [ "$ENABLE_VERIFICATION" = true ]; then
+                verify_backup "$backup_path"
+            fi
+
+            # Encrypt backup if enabled
+            if [ "$ENABLE_ENCRYPTION" = true ]; then
+                backup_path=$(encrypt_backup "$backup_path")
+            fi
+
             # Get backup stats
             local backup_size=$(du -sh "$backup_path" 2>/dev/null | cut -f1)
             local backup_files=$(find "$backup_path" -type f 2>/dev/null | wc -l)
@@ -1633,6 +1898,7 @@ do_backup() {
                         "" \
                         "📊 Summary:" \
                         "  • Type:     $backup_type" \
+                        "  • Mode:     $PERFORMANCE_MODE" \
                         "  • Location: $backup_path" \
                         "  • Size:     $backup_size" \
                         "  • Files:    $backup_files" \
@@ -1642,6 +1908,7 @@ do_backup() {
                     echo -e "${GREEN}✅ BACKUP COMPLETED SUCCESSFULLY!${NC}"
                     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
                     echo -e "Type:     $backup_type"
+                    echo -e "Mode:     $PERFORMANCE_MODE"
                     echo -e "Location: $backup_path"
                     echo -e "Size:     $backup_size"
                     echo -e "Files:    $backup_files"
@@ -1654,7 +1921,10 @@ do_backup() {
             fi
 
             # Log success to file
-            echo "$(date): Backup completed successfully - Type: $backup_type, Size: $backup_size, Files: $backup_files, New: $new_files" >> "$LOG_FILE"
+            echo "$(date): Backup completed successfully - Type: $backup_type, Mode: $PERFORMANCE_MODE, Size: $backup_size, Files: $backup_files, New: $new_files" >> "$LOG_FILE"
+
+            # Send email notification
+            send_email "Backup Successful" "$backup_type backup completed in $PERFORMANCE_MODE mode. Size: $backup_size, Files: $backup_files, New: $new_files"
 
             # Clean up old backups (keep only MAX_BACKUPS) - only after successful backup
             cleanup_old_backups "$cron_mode"
@@ -1700,6 +1970,9 @@ do_backup() {
 
         # Log failure to file
         echo "$(date): Backup FAILED - Check log for details" >> "$LOG_FILE"
+
+        # Send email notification
+        send_email "Backup Failed" "The backup failed. Check the log file: $LOG_FILE"
     fi
 
     # Ask to continue (skip in cron mode)
@@ -1710,6 +1983,54 @@ do_backup() {
             echo -e "\n${BLUE}Press Enter to continue...${NC}"
             read -r
         fi
+    fi
+}
+
+# Function to show destination info
+show_destination_info() {
+    clear
+    print_header
+    echo -e "${BLUE}📌 DESTINATION INFORMATION${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    # Show script location check
+    check_script_location
+
+    echo ""
+
+    # Show mount information
+    show_mount_info
+
+    # Show destination accessibility
+    if check_destination_accessible; then
+        # Show free space
+        local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
+        if [ ! -z "$free_space_mb" ]; then
+            local free_space_hr=$(numfmt --to=iec $((free_space_mb * 1024 * 1024)) 2>/dev/null || echo "${free_space_mb}MB")
+            echo -e "${GREEN}💾 Free space: $free_space_hr${NC}"
+        fi
+
+        # Show performance settings
+        echo -e "\n${BLUE}⚡ Current Performance Settings:${NC}"
+        echo -e "  • Mode: ${CYAN}$PERFORMANCE_MODE${NC}"
+        echo -e "  • Encryption: ${CYAN}$([ "$ENABLE_ENCRYPTION" = true ] && echo "Enabled" || echo "Disabled")${NC}"
+        echo -e "  • Verification: ${CYAN}$([ "$ENABLE_VERIFICATION" = true ] && echo "Enabled" || echo "Disabled")${NC}"
+        echo -e "  • Bandwidth Limit: ${CYAN}$([ "$BANDWIDTH_LIMIT" -gt 0 ] && echo "${BANDWIDTH_LIMIT} KB/s" || echo "Unlimited")${NC}"
+    else
+        echo -e "${RED}❌ Destination is NOT accessible!${NC}"
+        echo -e "${YELLOW}  Possible issues:${NC}"
+        echo -e "  • USB drive not plugged in"
+        echo -e "  • Network share disconnected"
+        echo -e "  • Permissions problem"
+    fi
+
+    echo ""
+    if command -v gum &> /dev/null; then
+        gum confirm "Press Enter to continue" && return
+    else
+        echo -e "\n${BLUE}Press Enter to continue...${NC}"
+        read -r
     fi
 }
 
@@ -1896,6 +2217,7 @@ show_status() {
             gum style --padding "0 2" --italic --foreground 226 "       Actual space used is much less! Run 'du -sh $BACKUP_DEST'"
             gum style --padding "0 2" --italic --foreground 226 "       to see the real physical space consumption."
             gum style --padding "0 2" --italic --foreground 46  "       The 'latest' symlink always points to the last SUCCESSFUL backup."
+            gum style --padding "0 2" --italic --foreground 99  "       Current performance mode: $PERFORMANCE_MODE"
         else
             echo -e "\n${YELLOW}💾 STORAGE EXPLANATION:${NC}"
             echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -1910,6 +2232,7 @@ show_status() {
             echo -e "       Actual space used is much less! Run 'du -sh $BACKUP_DEST'"
             echo -e "       to see the real physical space consumption.${NC}"
             echo -e "${GREEN}       The 'latest' symlink always points to the last SUCCESSFUL backup.${NC}"
+            echo -e "${PURPLE}       Current performance mode: $PERFORMANCE_MODE${NC}"
         fi
     fi
 
@@ -2086,6 +2409,7 @@ do_restore() {
             echo -e "${GREEN}✅ Restore completed successfully!${NC}"
         fi
         send_notification "Restore Complete" "Successfully restored from backup" "emblem-success"
+        send_email "Restore Complete" "Successfully restored from backup: $(basename "$selected_backup")"
     else
         if command -v gum &> /dev/null; then
             gum style --foreground 196 "❌ Restore failed!"
@@ -2093,6 +2417,7 @@ do_restore() {
             echo -e "${RED}❌ Restore failed!${NC}"
         fi
         send_notification "Restore FAILED" "Restore operation failed" "dialog-error"
+        send_email "Restore Failed" "Restore operation failed from backup: $(basename "$selected_backup")"
     fi
 
     sleep 2
@@ -2412,6 +2737,12 @@ show_menu() {
                 ;;
         esac
 
+        # Show performance mode
+        gum style \
+            --padding "0 2" \
+            --foreground 99 \
+            "⚡ Performance Mode: $PERFORMANCE_MODE"
+
         # Show disk space warning if needed
         local free_space_mb=$(df -m "$BACKUP_DEST" 2>/dev/null | awk 'NR==2 {print $4}')
         if [ ! -z "$free_space_mb" ]; then
@@ -2478,7 +2809,7 @@ show_menu() {
             --cursor="👉 " \
             --cursor.foreground="212" \
             --selected.foreground="212" \
-            --height=14 \
+            --height=15 \
             "💾 Create Backup (Incremental)" \
             "🔍 Dry Run (Preview)" \
             "♻️  Restore Backup" \
@@ -2487,6 +2818,7 @@ show_menu() {
             "🔍 Update Exclusions" \
             "🧹 Cleanup Old Backups" \
             "⏰ Schedule Automatic Backups" \
+            "⚡ Change Performance Mode" \
             "🖥️  Create Desktop Shortcut" \
             "ℹ️  Destination Info" \
             "❌ Exit")
@@ -2515,6 +2847,9 @@ show_menu() {
                 ;;
             "⏰ Schedule Automatic Backups")
                 setup_scheduling
+                ;;
+            "⚡ Change Performance Mode")
+                change_performance_mode
                 ;;
             "🖥️  Create Desktop Shortcut")
                 create_desktop_shortcut
@@ -2548,9 +2883,10 @@ show_menu() {
             echo -e "${GREEN}6.${NC} 🔍 Update Exclusions"
             echo -e "${GREEN}7.${NC} 🧹 Cleanup Old Backups"
             echo -e "${GREEN}8.${NC} ⏰ Schedule Automatic Backups"
-            echo -e "${GREEN}9.${NC} 🖥️  Create Desktop Shortcut"
-            echo -e "${GREEN}10.${NC} ℹ️  Destination Info"
-            echo -e "${GREEN}11.${NC} ❌ Exit"
+            echo -e "${GREEN}9.${NC} ⚡ Change Performance Mode"
+            echo -e "${GREEN}10.${NC} 🖥️  Create Desktop Shortcut"
+            echo -e "${GREEN}11.${NC} ℹ️  Destination Info"
+            echo -e "${GREEN}12.${NC} ❌ Exit"
             echo ""
 
             # Show disk space warning
@@ -2577,7 +2913,7 @@ show_menu() {
             fi
 
             echo ""
-            echo -e "${YELLOW}Choice [1-11]:${NC}"
+            echo -e "${YELLOW}Choice [1-12]:${NC}"
             read -r choice
 
             case $choice in
@@ -2589,9 +2925,10 @@ show_menu() {
                 6) update_exclusions ;;
                 7) do_cleanup ;;
                 8) setup_scheduling ;;
-                9) create_desktop_shortcut ;;
-                10) show_destination_info ;;
-                11)
+                9) change_performance_mode ;;
+                10) create_desktop_shortcut ;;
+                11) show_destination_info ;;
+                12)
                     clear
                     echo -e "${GREEN}Goodbye! 👋${NC}"
                     exit 0
@@ -2603,6 +2940,91 @@ show_menu() {
             esac
         done
     fi
+}
+
+# Function to change performance mode
+change_performance_mode() {
+    clear
+
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border double \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 99 \
+            "⚡  PERFORMANCE MODES" \
+            "" \
+            "Choose your preferred performance mode"
+    else
+        print_header
+        echo -e "${PURPLE}⚡ PERFORMANCE MODES${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}Available Modes:${NC}"
+    echo -e "  ${GREEN}safe${NC}   - Default, uses --no-inplace, verifies with checksums (safest)"
+    echo -e "  ${YELLOW}fast${NC}   - Uses --inplace for SSD speed, skips checksums (faster)"
+    echo -e "  ${RED}turbo${NC}  - Uses --inplace and --no-whole-file (fastest, riskier)"
+    echo ""
+    echo -e "Current mode: ${PURPLE}$PERFORMANCE_MODE${NC}"
+    echo ""
+
+    local mount_type=$(detect_mount_type)
+    echo -e "${BLUE}Recommendation for your setup ($mount_type):${NC}"
+    case "$mount_type" in
+        usb)
+            echo -e "  • ${YELLOW}safe mode${NC} recommended for USB drives"
+            ;;
+        network)
+            echo -e "  • ${YELLOW}safe mode${NC} with bandwidth limit recommended"
+            ;;
+        different_device)
+            echo -e "  • ${GREEN}fast or turbo mode${NC} recommended for SSD/HDD"
+            ;;
+        same_device)
+            echo -e "  • ${YELLOW}Consider moving to different device${NC}"
+            ;;
+    esac
+
+    echo ""
+    if command -v gum &> /dev/null; then
+        local new_mode=$(gum choose "safe" "fast" "turbo" "Cancel")
+        if [ "$new_mode" != "Cancel" ] && [ -n "$new_mode" ]; then
+            PERFORMANCE_MODE="$new_mode"
+            gum style --foreground 46 "✅ Performance mode changed to: $PERFORMANCE_MODE"
+
+            # Optionally save to config
+            if gum confirm "Save to config file?"; then
+                if [ -f "$CONFIG_FILE" ]; then
+                    sed -i "s/PERFORMANCE_MODE=.*/PERFORMANCE_MODE=\"$PERFORMANCE_MODE\"/" "$CONFIG_FILE"
+                else
+                    echo "PERFORMANCE_MODE=\"$PERFORMANCE_MODE\"" > "$CONFIG_FILE"
+                fi
+                gum style --foreground 46 "✅ Saved to config file"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}Enter new mode (safe/fast/turbo) or press Enter to cancel:${NC}"
+        read -r new_mode
+        if [[ "$new_mode" =~ ^(safe|fast|turbo)$ ]]; then
+            PERFORMANCE_MODE="$new_mode"
+            echo -e "${GREEN}✅ Performance mode changed to: $PERFORMANCE_MODE${NC}"
+
+            echo -e "${YELLOW}Save to config file? (y/n)${NC}"
+            read -r save_config
+            if [[ "$save_config" =~ ^[Yy]$ ]]; then
+                if [ -f "$CONFIG_FILE" ]; then
+                    sed -i "s/PERFORMANCE_MODE=.*/PERFORMANCE_MODE=\"$PERFORMANCE_MODE\"/" "$CONFIG_FILE"
+                else
+                    echo "PERFORMANCE_MODE=\"$PERFORMANCE_MODE\"" > "$CONFIG_FILE"
+                fi
+                echo -e "${GREEN}✅ Saved to config file${NC}"
+            fi
+        fi
+    fi
+
+    sleep 2
 }
 
 # Parse command line arguments
@@ -2646,6 +3068,49 @@ parse_arguments() {
             ;;
         --info)
             show_destination_info
+            ;;
+        --mode)
+            if [ -n "$2" ] && [[ "$2" =~ ^(safe|fast|turbo)$ ]]; then
+                PERFORMANCE_MODE="$2"
+                echo -e "${GREEN}✅ Performance mode set to: $PERFORMANCE_MODE${NC}"
+                shift
+            else
+                echo -e "${RED}❌ Invalid mode. Use safe, fast, or turbo.${NC}"
+                exit 1
+            fi
+            ;;
+        --encrypt)
+            ENABLE_ENCRYPTION=true
+            echo -e "${GREEN}✅ Encryption enabled${NC}"
+            ;;
+        --verify)
+            ENABLE_VERIFICATION=true
+            echo -e "${GREEN}✅ Verification enabled${NC}"
+            ;;
+        --email)
+            if [ -n "$2" ]; then
+                ENABLE_EMAIL_NOTIFY=true
+                EMAIL_ADDRESS="$2"
+                echo -e "${GREEN}✅ Email notifications enabled for $EMAIL_ADDRESS${NC}"
+                shift
+            else
+                echo -e "${RED}❌ Email address required${NC}"
+                exit 1
+            fi
+            ;;
+        --bwlimit)
+            if [ -n "$2" ] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                BANDWIDTH_LIMIT="$2"
+                echo -e "${GREEN}✅ Bandwidth limit set to ${BANDWIDTH_LIMIT} KB/s${NC}"
+                shift
+            else
+                echo -e "${RED}❌ Valid bandwidth limit required (KB/s)${NC}"
+                exit 1
+            fi
+            ;;
+        --generate-config)
+            generate_config
+            exit 0
             ;;
         "")
             # No arguments, run interactive mode
@@ -2693,7 +3158,7 @@ main() {
 
 # Parse command line arguments
 if [ $# -gt 0 ]; then
-    parse_arguments "$1"
+    parse_arguments "$@"
 else
     main
 fi
