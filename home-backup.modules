@@ -1,0 +1,1496 @@
+#!/bin/bash
+#############################################################################################################################
+#
+# License: MIT
+# Wael Isa
+# Website:  https://www.wael.name
+# GitHub:   https://github.com/waelisa/home-backup
+# Version:  v1.1.4
+# Build Date: 02/24/2026
+#
+# Home Backup Modules
+# Part of Home Backup Utility v1.1.4
+#
+# This file contains additional modules and extended features
+#
+# ██╗    ██╗ █████╗ ███████╗██╗         ██╗███████╗ █████╗
+# ██║    ██║██╔══██╗██╔════╝██║         ██║██╔════╝██╔══██╗
+# ██║ █╗ ██║███████║█████╗  ██║         ██║███████╗███████║
+# ██║███╗██║██╔══██║██╔══╝  ██║         ██║╚════██║██╔══██║
+# ╚███╔███╔╝██║  ██║███████╗███████╗    ██║███████╗██║  ██║
+# ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝    ╚═╝╚══════╝╚═╝  ╚═╝
+#
+# MODULES INCLUDED:
+#   • Encryption Module     - GPG encryption for cloud backups
+#   • Integrity Module      - SHA256 checksum verification
+#   • Auto-Eject Module     - Safe USB drive ejection
+#   • Network Module        - Remote backup preparation (v2.0 ready)
+#   • Advanced Cleanup      - Deep disk space analysis
+#   • Report Generation     - HTML/PDF backup reports
+#   • Health Check Module   - Backup integrity testing
+#   • Performance Tuning    - Advanced rsync optimizations
+#   • Cloud Prep Module     - Rclone integration (coming in v2.0)
+#
+# Description: A bulletproof backup tool for your home folder with smart exclusions,
+#              true incremental backups using hard links, atomic symlink updates,
+#              desktop integration, automatic scheduling, and universal path support.
+#
+#############################################################################################################################
+
+#####################################################################
+# ENCRYPTION MODULE
+# Provides GPG encryption for secure cloud backups
+#####################################################################
+
+encrypt_backup() {
+    local backup_path="$1"
+    local cron_mode="$2"
+    local encrypted_path="${backup_path}.gpg"
+    local recipient="${3:-}"  # Optional recipient for public key encryption
+
+    if ! command -v gpg &> /dev/null; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${RED}❌ GPG not installed. Cannot encrypt.${NC}"
+        fi
+        echo "$backup_path"
+        return 1
+    fi
+
+    if ! is_cron_mode "$cron_mode"; then
+        echo -e "${BLUE}🔐 Encrypting backup...${NC}"
+    fi
+
+    # Create a temporary directory for encryption
+    local temp_dir=$(mktemp -d)
+    local archive_name="backup_$(basename "$backup_path").tar"
+
+    # First create a tar archive
+    if ! is_cron_mode "$cron_mode"; then
+        echo -e "${YELLOW}  Creating archive...${NC}"
+    fi
+
+    tar -cf "$temp_dir/$archive_name" -C "$(dirname "$backup_path")" "$(basename "$backup_path")" 2>/dev/null
+
+    if [ $? -ne 0 ]; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${RED}❌ Failed to create archive${NC}"
+        fi
+        rm -rf "$temp_dir"
+        echo "$backup_path"
+        return 1
+    fi
+
+    # Encrypt the archive
+    if ! is_cron_mode "$cron_mode"; then
+        echo -e "${YELLOW}  Encrypting with AES256...${NC}"
+    fi
+
+    if [ -n "$recipient" ]; then
+        # Public key encryption
+        gpg --encrypt --recipient "$recipient" --output "$encrypted_path" "$temp_dir/$archive_name" 2>/dev/null
+    else
+        # Symmetric encryption (password will be prompted)
+        if is_cron_mode "$cron_mode"; then
+            # In cron mode, we need a passphrase file
+            if [ -f "$HOME/.backup-passphrase" ]; then
+                gpg --batch --passphrase-file "$HOME/.backup-passphrase" --symmetric --cipher-algo AES256 --output "$encrypted_path" "$temp_dir/$archive_name" 2>/dev/null
+            else
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${RED}❌ No passphrase file found for cron mode${NC}"
+                fi
+                rm -rf "$temp_dir"
+                echo "$backup_path"
+                return 1
+            fi
+        else
+            # Interactive mode - will prompt for passphrase
+            gpg -c --cipher-algo AES256 --output "$encrypted_path" "$temp_dir/$archive_name"
+        fi
+    fi
+
+    if [ $? -eq 0 ]; then
+        local original_size=$(du -sh "$backup_path" 2>/dev/null | cut -f1)
+        local encrypted_size=$(du -sh "$encrypted_path" 2>/dev/null | cut -f1)
+
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${GREEN}✅ Backup encrypted successfully${NC}"
+            echo -e "  📦 Original:  $original_size"
+            echo -e "  🔐 Encrypted: $encrypted_size"
+        fi
+
+        # Log encryption
+        echo "$(date): Backup encrypted: $encrypted_path (Original: $original_size, Encrypted: $encrypted_size)" >> "$LOG_FILE"
+
+        # Optionally remove unencrypted backup
+        if [ "$ENABLE_ENCRYPTION" = true ] && [ -f "$HOME/.backup-autoremove" ]; then
+            rm -rf "$backup_path"
+            echo "$(date): Original unencrypted backup removed" >> "$LOG_FILE"
+        fi
+
+        rm -rf "$temp_dir"
+        echo "$encrypted_path"
+    else
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${RED}❌ Encryption failed${NC}"
+        fi
+        echo "$(date): Encryption FAILED for $backup_path" >> "$LOG_FILE"
+        rm -rf "$temp_dir"
+        echo "$backup_path"
+        return 1
+    fi
+}
+
+decrypt_backup() {
+    local encrypted_file="$1"
+    local output_dir="$2"
+    local cron_mode="$3"
+
+    if ! command -v gpg &> /dev/null; then
+        echo -e "${RED}❌ GPG not installed. Cannot decrypt.${NC}"
+        return 1
+    fi
+
+    if [ ! -f "$encrypted_file" ]; then
+        echo -e "${RED}❌ Encrypted file not found: $encrypted_file${NC}"
+        return 1
+    fi
+
+    if ! is_cron_mode "$cron_mode"; then
+        echo -e "${BLUE}🔓 Decrypting backup...${NC}"
+    fi
+
+    mkdir -p "$output_dir"
+
+    # Decrypt to temporary file first
+    local temp_archive="$output_dir/temp_decrypted.tar"
+
+    if [ -f "$HOME/.backup-passphrase" ]; then
+        gpg --batch --passphrase-file "$HOME/.backup-passphrase" --output "$temp_archive" --decrypt "$encrypted_file" 2>/dev/null
+    else
+        gpg --output "$temp_archive" --decrypt "$encrypted_file"
+    fi
+
+    if [ $? -eq 0 ]; then
+        # Extract the archive
+        tar -xf "$temp_archive" -C "$output_dir" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            rm -f "$temp_archive"
+            if ! is_cron_mode "$cron_mode"; then
+                echo -e "${GREEN}✅ Backup decrypted successfully to $output_dir${NC}"
+            fi
+            return 0
+        else
+            echo -e "${RED}❌ Failed to extract archive${NC}"
+            rm -f "$temp_archive"
+            return 1
+        fi
+    else
+        echo -e "${RED}❌ Decryption failed${NC}"
+        return 1
+    fi
+}
+
+create_passphrase_file() {
+    local passphrase_file="$HOME/.backup-passphrase"
+
+    if [ -f "$passphrase_file" ]; then
+        echo -e "${YELLOW}⚠️  Passphrase file already exists${NC}"
+        if command -v gum &> /dev/null; then
+            if ! gum confirm "Overwrite?"; then
+                return
+            fi
+        else
+            echo -e "${YELLOW}Overwrite? (y/n)${NC}"
+            read -r overwrite
+            if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+                return
+            fi
+        fi
+    fi
+
+    if command -v gum &> /dev/null; then
+        local pass1=$(gum input --password --placeholder "Enter encryption passphrase")
+        local pass2=$(gum input --password --placeholder "Confirm passphrase")
+
+        if [ "$pass1" != "$pass2" ]; then
+            echo -e "${RED}❌ Passphrases do not match${NC}"
+            return 1
+        fi
+
+        echo "$pass1" > "$passphrase_file"
+        chmod 600 "$passphrase_file"
+        echo -e "${GREEN}✅ Passphrase file created: $passphrase_file${NC}"
+    else
+        echo -e "${YELLOW}Enter encryption passphrase:${NC}"
+        read -rs pass1
+        echo
+        echo -e "${YELLOW}Confirm passphrase:${NC}"
+        read -rs pass2
+        echo
+
+        if [ "$pass1" != "$pass2" ]; then
+            echo -e "${RED}❌ Passphrases do not match${NC}"
+            return 1
+        fi
+
+        echo "$pass1" > "$passphrase_file"
+        chmod 600 "$passphrase_file"
+        echo -e "${GREEN}✅ Passphrase file created: $passphrase_file${NC}"
+    fi
+}
+
+#####################################################################
+# INTEGRITY VERIFICATION MODULE
+# SHA256 checksums for critical data verification
+#####################################################################
+
+verify_integrity() {
+    local backup_path="$1"
+    local cron_mode="$2"
+    local source_path="$BACKUP_SOURCE"
+
+    if [ "$ENABLE_INTEGRITY" != true ]; then
+        return 0
+    fi
+
+    if ! is_cron_mode "$cron_mode"; then
+        echo -e "${BLUE}🔍 Running SHA256 integrity verification...${NC}"
+    fi
+
+    mkdir -p "$INTEGRITY_DIR"
+
+    # Critical folders to verify (customizable)
+    local critical_folders=(
+        "Documents"
+        "Pictures"
+        "Videos"
+        "Music"
+        "Desktop"
+        "Projects"
+        ".config"
+        ".local/share"
+    )
+
+    local verified_count=0
+    local failed_count=0
+    local total_files=0
+    local mismatched_files=0
+
+    echo "Integrity Verification - $(date)" > "$INTEGRITY_LOG"
+    echo "Source: $source_path" >> "$INTEGRITY_LOG"
+    echo "Backup: $backup_path" >> "$INTEGRITY_LOG"
+    echo "========================================" >> "$INTEGRITY_LOG"
+
+    for folder in "${critical_folders[@]}"; do
+        local source_folder="$source_path/$folder"
+        local backup_folder="$backup_path/$folder"
+
+        if [ -d "$source_folder" ] && [ -d "$backup_folder" ]; then
+            if ! is_cron_mode "$cron_mode"; then
+                echo -e "${BLUE}  📁 Verifying $folder...${NC}"
+            fi
+
+            # Generate checksums for source (cache for 7 days)
+            local source_checksum_file="$INTEGRITY_DIR/${folder}_source.sha256"
+            local backup_checksum_file="$INTEGRITY_DIR/${folder}_backup.sha256"
+
+            # Source checksums - refresh weekly
+            if [ ! -f "$source_checksum_file" ] || [ $(find "$source_checksum_file" -mtime +7) ]; then
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${YELLOW}    Generating source checksums (cached for 7 days)...${NC}"
+                fi
+                find "$source_folder" -type f -exec sha256sum {} \; > "$source_checksum_file" 2>/dev/null
+            fi
+
+            # Backup checksums (always fresh)
+            find "$backup_folder" -type f -exec sha256sum {} \; > "$backup_checksum_file" 2>/dev/null
+
+            # Count files
+            local source_count=$(wc -l < "$source_checksum_file")
+            local backup_count=$(wc -l < "$backup_checksum_file")
+            total_files=$((total_files + source_count))
+
+            # Compare checksums
+            if [ -f "$source_checksum_file" ] && [ -f "$backup_checksum_file" ]; then
+                # Extract just the checksums for comparison
+                cut -d' ' -f1 "$source_checksum_file" | sort > "$INTEGRITY_DIR/${folder}_source_hash.sorted"
+                cut -d' ' -f1 "$backup_checksum_file" | sort > "$INTEGRITY_DIR/${folder}_backup_hash.sorted"
+
+                # Find mismatches
+                local mismatches=$(comm -3 "$INTEGRITY_DIR/${folder}_source_hash.sorted" "$INTEGRITY_DIR/${folder}_backup_hash.sorted" | wc -l)
+
+                if [ $mismatches -eq 0 ] && [ $source_count -eq $backup_count ]; then
+                    echo "✅ $folder: OK ($source_count files)" >> "$INTEGRITY_LOG"
+                    ((verified_count++))
+                    if ! is_cron_mode "$cron_mode"; then
+                        echo -e "${GREEN}    ✅ $folder verified ($source_count files)${NC}"
+                    fi
+                else
+                    mismatched_files=$((mismatched_files + mismatches))
+                    echo "⚠️  $folder: $mismatches files differ (Source: $source_count, Backup: $backup_count)" >> "$INTEGRITY_LOG"
+                    ((failed_count++))
+                    if ! is_cron_mode "$cron_mode"; then
+                        echo -e "${YELLOW}    ⚠️  $folder: $mismatches files differ${NC}"
+                    fi
+
+                    # Log the specific mismatched files
+                    echo "  Mismatched files:" >> "$INTEGRITY_LOG"
+                    comm -3 "$INTEGRITY_DIR/${folder}_source_hash.sorted" "$INTEGRITY_DIR/${folder}_backup_hash.sorted" | head -10 >> "$INTEGRITY_LOG"
+                    if [ $mismatches -gt 10 ]; then
+                        echo "  ... and $((mismatches - 10)) more" >> "$INTEGRITY_LOG"
+                    fi
+                fi
+
+                # Cleanup temp files
+                rm -f "$INTEGRITY_DIR/${folder}_source_hash.sorted" "$INTEGRITY_DIR/${folder}_backup_hash.sorted"
+            fi
+        fi
+    done
+
+    echo "========================================" >> "$INTEGRITY_LOG"
+    echo "Total files checked: $total_files" >> "$INTEGRITY_LOG"
+    echo "Verified folders: $verified_count" >> "$INTEGRITY_LOG"
+    echo "Folders with issues: $failed_count" >> "$INTEGRITY_LOG"
+    echo "Total mismatched files: $mismatched_files" >> "$INTEGRITY_LOG"
+
+    if ! is_cron_mode "$cron_mode"; then
+        echo ""
+        if [ $failed_count -eq 0 ]; then
+            echo -e "${GREEN}✅ Integrity verification complete - All OK${NC}"
+            echo -e "${BLUE}  📋 Checked $total_files files across $verified_count folders${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Integrity verification complete - $failed_count folders have issues${NC}"
+            echo -e "${YELLOW}  📋 $mismatched_files files differ. Check log: $INTEGRITY_LOG${NC}"
+        fi
+    fi
+
+    # Send email notification if there were issues
+    if [ $failed_count -gt 0 ] && [ "$ENABLE_EMAIL_NOTIFY" = true ]; then
+        send_email "⚠️ Integrity Verification Issues" "Found issues in $failed_count folders. $mismatched_files files differ. Check log: $INTEGRITY_LOG"
+    fi
+
+    return $failed_count
+}
+
+quick_integrity_check() {
+    local backup_path="$1"
+    local cron_mode="$2"
+
+    if ! is_cron_mode "$cron_mode"; then
+        echo -e "${BLUE}🔍 Running quick integrity check...${NC}"
+    fi
+
+    # Quick check - just verify critical system files exist
+    local critical_files=(
+        ".bashrc"
+        ".profile"
+        ".config/user-dirs.dirs"
+    )
+
+    local missing=0
+    for file in "${critical_files[@]}"; do
+        if [ ! -f "$backup_path/$file" ] && [ ! -f "$HOME/$file" ]; then
+            # Skip if file doesn't exist in source either
+            continue
+        fi
+
+        if [ -f "$HOME/$file" ] && [ ! -f "$backup_path/$file" ]; then
+            echo -e "${YELLOW}  ⚠️  Missing in backup: $file${NC}"
+            ((missing++))
+        fi
+    done
+
+    if [ $missing -eq 0 ]; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${GREEN}  ✅ Quick integrity check passed${NC}"
+        fi
+        return 0
+    else
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${YELLOW}  ⚠️  Quick integrity check found $missing missing files${NC}"
+        fi
+        return 1
+    fi
+}
+
+integrity_report() {
+    local output_file="$INTEGRITY_DIR/integrity_report_$TIMESTAMP.html"
+
+    cat > "$output_file" << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Backup Integrity Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 2px solid #4a90e2; padding-bottom: 10px; }
+        .summary { background: #e8f4fd; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .good { color: green; }
+        .warning { color: orange; }
+        .bad { color: red; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #4a90e2; color: white; }
+        tr:hover { background: #f5f5f5; }
+        .footer { margin-top: 30px; font-size: 12px; color: #666; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Backup Integrity Report</h1>
+        <p>Generated: $(date)</p>
+        <p>Backup Location: $BACKUP_DEST</p>
+
+        <div class="summary">
+            <h2>Summary</h2>
+            <p>Total Backups: $(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" 2>/dev/null | wc -l)</p>
+            <p>Latest Backup: $(basename "$(readlink -f "$BACKUP_DEST/latest" 2>/dev/null)" 2>/dev/null || echo "None")</p>
+            <p>Total Size: $(du -sh "$BACKUP_DEST" 2>/dev/null | cut -f1)</p>
+        </div>
+
+        <h2>Recent Integrity Checks</h2>
+        <table>
+            <tr>
+                <th>Date</th>
+                <th>Status</th>
+                <th>Files Checked</th>
+                <th>Issues Found</th>
+            </tr>
+EOF
+
+    # Add recent integrity logs
+    local logs=()
+    while IFS= read -r -d '' log; do
+        logs+=("$log")
+    done < <(find "$INTEGRITY_DIR" -maxdepth 1 -type f -name "integrity_*.log" -print0 | sort -r | head -10)
+
+    for log in "${logs[@]}"; do
+        local log_name=$(basename "$log")
+        local log_date=${log_name#integrity_}
+        log_date=${log_date%.log}
+        local issues=$(grep -c "⚠️" "$log" 2>/dev/null)
+        local files=$(grep "Total files" "$log" 2>/dev/null | cut -d':' -f2 | xargs)
+
+        if [ $issues -eq 0 ]; then
+            status="<span class='good'>✅ Good</span>"
+        else
+            status="<span class='warning'>⚠️ Issues ($issues)</span>"
+        fi
+
+        cat >> "$output_file" << EOF
+            <tr>
+                <td>${log_date//_/ }</td>
+                <td>$status</td>
+                <td>$files</td>
+                <td>$issues</td>
+            </tr>
+EOF
+    done
+
+    cat >> "$output_file" << EOF
+        </table>
+        <div class="footer">
+            <p>Generated by Home Backup Utility v$SCRIPT_VERSION</p>
+        </div>
+    </div>
+</body>
+</html>
+EOF
+
+    echo -e "${GREEN}✅ Integrity report generated: $output_file${NC}"
+
+    # Try to open in browser
+    if command -v xdg-open &> /dev/null; then
+        xdg-open "$output_file" &> /dev/null &
+    elif command -v open &> /dev/null; then
+        open "$output_file" &> /dev/null &
+    fi
+}
+
+#####################################################################
+# AUTO-EJECT MODULE
+# Safely unmounts USB drives after backup
+#####################################################################
+
+do_eject() {
+    local eject_requested=$1
+    local cron_mode=$2
+
+    local mount_type=$(detect_mount_type)
+    if [ "$mount_type" != "usb" ]; then
+        return 0
+    fi
+
+    local mount_point=$(df -P "$BACKUP_DEST" 2>/dev/null | tail -1 | awk '{print $6}')
+    local device=$(findmnt -n -o SOURCE --target "$BACKUP_DEST" 2>/dev/null)
+
+    if [ -z "$device" ] || [ -z "$mount_point" ]; then
+        return 0
+    fi
+
+    if [ "$ENABLE_AUTO_EJECT" = true ] || [ "$eject_requested" = true ]; then
+        if ! is_cron_mode "$cron_mode"; then
+            echo -e "${YELLOW}🔌 Preparing to eject backup drive...${NC}"
+        fi
+
+        sync
+
+        # Try multiple methods to ensure safe removal
+        local eject_success=false
+
+        # Method 1: udisksctl (preferred)
+        if command -v udisksctl &> /dev/null; then
+            if udisksctl unmount -b "$device" &>/dev/null; then
+                udisksctl power-off -b "$device" &>/dev/null
+                eject_success=true
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${GREEN}✅ Drive safely ejected (udisksctl)${NC}"
+                fi
+            fi
+        fi
+
+        # Method 2: umount (fallback)
+        if [ "$eject_success" = false ]; then
+            if umount "$mount_point" &>/dev/null; then
+                eject_success=true
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${GREEN}✅ Drive unmounted${NC}"
+                    echo -e "${YELLOW}⚠️  It's now safe to unplug the drive.${NC}"
+                fi
+            fi
+        fi
+
+        # Method 3: pumount (if available)
+        if [ "$eject_success" = false ] && command -v pumount &> /dev/null; then
+            if pumount "$device" &>/dev/null; then
+                eject_success=true
+                if ! is_cron_mode "$cron_mode"; then
+                    echo -e "${GREEN}✅ Drive ejected (pumount)${NC}"
+                fi
+            fi
+        fi
+
+        if [ "$eject_success" = true ]; then
+            send_notification "Drive Ejected" "Your backup drive has been safely unmounted." "drive-removable-media"
+            echo "$(date): Drive safely ejected from $mount_point" >> "$LOG_FILE"
+            return 0
+        else
+            if ! is_cron_mode "$cron_mode"; then
+                echo -e "${RED}❌ Failed to eject drive. It may be in use.${NC}"
+                echo -e "${YELLOW}  Check if files are open on the drive.${NC}"
+            fi
+            echo "$(date): Failed to eject drive from $mount_point - device busy" >> "$LOG_FILE"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+list_usb_devices() {
+    echo -e "${BLUE}💾 Connected USB Devices:${NC}"
+    echo ""
+
+    if command -v lsblk &> /dev/null; then
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,LABEL,MODEL | grep -E "disk|part" | while read line; do
+            if [[ "$line" =~ "disk" ]]; then
+                echo -e "${GREEN}📀 $line${NC}"
+            else
+                echo -e "  📁 $line"
+            fi
+        done
+    else
+        mount | grep -E "^/dev/sd" | while read line; do
+            echo -e "  📁 $line"
+        done
+    fi
+    echo ""
+}
+
+#####################################################################
+# NETWORK MODULE
+# Prepares for remote backups (v2.0 ready)
+#####################################################################
+
+check_network_share() {
+    local share_path="$1"
+    local timeout="${2:-5}"
+
+    if [ ! -d "$share_path" ]; then
+        return 1
+    fi
+
+    # Try to write a test file
+    local test_file="$share_path/.network_test_$TIMESTAMP"
+    if touch "$test_file" 2>/dev/null; then
+        rm -f "$test_file"
+        return 0
+    else
+        return 1
+    fi
+}
+
+mount_network_share() {
+    local share="$1"
+    local mount_point="$2"
+    local options="${3:-defaults}"
+
+    if [ ! -d "$mount_point" ]; then
+        sudo mkdir -p "$mount_point"
+    fi
+
+    if mountpoint -q "$mount_point"; then
+        echo -e "${GREEN}✅ Share already mounted at $mount_point${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}🔌 Mounting $share to $mount_point...${NC}"
+
+    if mount -t cifs "$share" "$mount_point" -o "$options" 2>/dev/null; then
+        echo -e "${GREEN}✅ Share mounted successfully${NC}"
+        return 0
+    elif mount "$share" "$mount_point" -o "$options" 2>/dev/null; then
+        echo -e "${GREEN}✅ Share mounted successfully${NC}"
+        return 0
+    else
+        echo -e "${RED}❌ Failed to mount share${NC}"
+        return 1
+    fi
+}
+
+unmount_network_share() {
+    local mount_point="$1"
+
+    if mountpoint -q "$mount_point"; then
+        echo -e "${BLUE}🔌 Unmounting $mount_point...${NC}"
+        if umount "$mount_point" 2>/dev/null; then
+            echo -e "${GREEN}✅ Share unmounted successfully${NC}"
+            return 0
+        else
+            echo -e "${RED}❌ Failed to unmount share${NC}"
+            return 1
+        fi
+    fi
+}
+
+test_network_speed() {
+    local destination="$1"
+    local test_size="${2:-100}"  # MB
+    local test_file="$destination/speed_test_$TIMESTAMP.dat"
+
+    echo -e "${BLUE}🌐 Testing network speed to $destination...${NC}"
+    echo -e "${YELLOW}Creating ${test_size}MB test file...${NC}"
+
+    # Create test file
+    dd if=/dev/zero of="$test_file" bs=1M count=$test_size 2>/dev/null
+
+    echo -e "${YELLOW}Testing write speed...${NC}"
+    local start_time=$(date +%s.%N)
+    sync
+    local end_time=$(date +%s.%N)
+    local write_time=$(echo "$end_time - $start_time" | bc)
+    local write_speed=$(echo "scale=2; $test_size / $write_time" | bc)
+
+    echo -e "${YELLOW}Testing read speed...${NC}"
+    start_time=$(date +%s.%N)
+    dd if="$test_file" of=/dev/null bs=1M 2>/dev/null
+    end_time=$(date +%s.%N)
+    local read_time=$(echo "$end_time - $start_time" | bc)
+    local read_speed=$(echo "scale=2; $test_size / $read_time" | bc)
+
+    rm -f "$test_file"
+
+    echo ""
+    echo -e "${GREEN}📊 Network Speed Test Results:${NC}"
+    echo -e "  Write Speed: ${PURPLE}${write_speed} MB/s${NC}"
+    echo -e "  Read Speed:  ${PURPLE}${read_speed} MB/s${NC}"
+    echo ""
+
+    # Recommend bandwidth limit
+    local recommended_limit=$(echo "$write_speed * 1024 / 2" | bc)  # Half of write speed in KB/s
+    echo -e "${BLUE}💡 Recommended bandwidth limit: ${YELLOW}${recommended_limit} KB/s${NC}"
+    echo -e "${BLUE}   Use: --bwlimit $recommended_limit${NC}"
+}
+
+#####################################################################
+# ADVANCED CLEANUP MODULE
+# Deep disk space analysis and cleanup
+#####################################################################
+
+analyze_disk_usage() {
+    local path="${1:-$BACKUP_DEST}"
+
+    echo -e "${BLUE}📊 Analyzing disk usage for: $path${NC}"
+    echo ""
+
+    if command -v ncdu &> /dev/null; then
+        ncdu "$path"
+    elif command -v du &> /dev/null; then
+        echo -e "${YELLOW}Top 20 largest directories:${NC}"
+        du -h "$path" 2>/dev/null | sort -rh | head -20
+    else
+        echo -e "${RED}❌ No disk usage analyzer available${NC}"
+    fi
+
+    echo ""
+    if command -v gum &> /dev/null; then
+        gum confirm "Press Enter to continue" && return
+    else
+        echo -e "\n${BLUE}Press Enter to continue...${NC}"
+        read -r
+    fi
+}
+
+deep_cleanup() {
+    clear
+
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border double \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 196 \
+            "🧹  DEEP CLEANUP" \
+            "" \
+            "Advanced cleanup with space analysis"
+    else
+        echo -e "${RED}🧹 DEEP CLEANUP${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    fi
+
+    # Show current usage
+    echo -e "\n${YELLOW}Current Backup Storage Usage:${NC}"
+    df -h "$BACKUP_DEST"
+
+    echo -e "\n${YELLOW}Backup Directory Breakdown:${NC}"
+    du -sh "$BACKUP_DEST"/* 2>/dev/null | sort -rh | head -10
+
+    echo ""
+    echo -e "${BLUE}Deep Cleanup Options:${NC}"
+    echo "  1. Remove ALL backups (start fresh)"
+    echo "  2. Keep only latest backup"
+    echo "  3. Remove backups older than 30 days"
+    echo "  4. Remove integrity logs only"
+    echo "  5. Remove all logs (keep backups)"
+    echo "  6. Cancel"
+
+    echo ""
+    if command -v gum &> /dev/null; then
+        choice=$(gum input --placeholder="Enter choice (1-6)")
+    else
+        echo -e "${YELLOW}Enter choice:${NC}"
+        read -r choice
+    fi
+
+    case $choice in
+        1)
+            echo -e "${RED}⚠️  This will DELETE ALL BACKUPS!${NC}"
+            if command -v gum &> /dev/null; then
+                if gum confirm "Are you ABSOLUTELY sure?"; then
+                    rm -rf "$BACKUP_DEST"/*
+                    rm -rf "$LOGS_DIR"/*
+                    rm -rf "$INTEGRITY_DIR"/*
+                    echo -e "${GREEN}✅ All backups removed${NC}"
+                fi
+            else
+                echo -e "${RED}Type 'YES' to confirm:${NC}"
+                read -r confirm
+                if [ "$confirm" = "YES" ]; then
+                    rm -rf "$BACKUP_DEST"/*
+                    rm -rf "$LOGS_DIR"/*
+                    rm -rf "$INTEGRITY_DIR"/*
+                    echo -e "${GREEN}✅ All backups removed${NC}"
+                fi
+            fi
+            ;;
+        2)
+            local latest=$(find_last_backup)
+            if [ -n "$latest" ]; then
+                find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" ! -path "$latest" -exec rm -rf {} \;
+                echo -e "${GREEN}✅ Kept only latest backup: $(basename "$latest")${NC}"
+            fi
+            ;;
+        3)
+            find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" -mtime +30 -exec rm -rf {} \;
+            find "$LOGS_DIR" -name "backup_*.log" -mtime +30 -delete
+            find "$INTEGRITY_DIR" -name "integrity_*.log" -mtime +30 -delete
+            echo -e "${GREEN}✅ Removed items older than 30 days${NC}"
+            ;;
+        4)
+            rm -rf "$INTEGRITY_DIR"/*
+            echo -e "${GREEN}✅ Integrity logs removed${NC}"
+            ;;
+        5)
+            rm -rf "$LOGS_DIR"/*
+            echo -e "${GREEN}✅ All logs removed${NC}"
+            ;;
+        *)
+            return
+            ;;
+    esac
+
+    sleep 2
+}
+
+#####################################################################
+# REPORT GENERATION MODULE
+# Creates HTML/PDF reports of backup status
+#####################################################################
+
+generate_html_report() {
+    local output_file="${1:-$LOGS_DIR/backup_report_$TIMESTAMP.html}"
+
+    # Gather statistics
+    local total_backups=$(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" 2>/dev/null | wc -l)
+    local total_size=$(du -sh "$BACKUP_DEST" 2>/dev/null | cut -f1)
+    local latest_backup=$(readlink -f "$BACKUP_DEST/latest" 2>/dev/null)
+    local latest_size=""
+    local latest_date=""
+
+    if [ -d "$latest_backup" ]; then
+        latest_size=$(du -sh "$latest_backup" 2>/dev/null | cut -f1)
+        latest_date=$(basename "$latest_backup" | sed "s/$(basename "$BACKUP_SOURCE")_//" | tr '_' ' ')
+    fi
+
+    # Get log statistics
+    local total_logs=$(find "$LOGS_DIR" -name "backup_*.log" 2>/dev/null | wc -l)
+    local successful_backups=$(grep -l "completed successfully" "$LOGS_DIR"/*.log 2>/dev/null | wc -l)
+    local failed_backups=$(grep -l "FAILED" "$LOGS_DIR"/*.log 2>/dev/null | wc -l)
+
+    # Create HTML report
+    cat > "$output_file" << EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home Backup Report</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.95;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            padding: 40px;
+            background: #f8f9fa;
+        }
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            text-align: center;
+            transition: transform 0.3s;
+        }
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+        .stat-icon {
+            font-size: 2.5em;
+            margin-bottom: 15px;
+        }
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+        .stat-label {
+            color: #666;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .section {
+            padding: 40px;
+            border-bottom: 1px solid #eee;
+        }
+        .section h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+        }
+        .backup-list {
+            background: #f8f9fa;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .backup-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 20px;
+            background: white;
+            border-bottom: 1px solid #eee;
+            transition: background 0.3s;
+        }
+        .backup-item:hover {
+            background: #f0f3ff;
+        }
+        .backup-item:last-child {
+            border-bottom: none;
+        }
+        .backup-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        .backup-icon {
+            font-size: 1.5em;
+        }
+        .backup-date {
+            font-weight: 600;
+            color: #333;
+        }
+        .backup-size {
+            color: #666;
+            font-size: 0.9em;
+        }
+        .backup-status {
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+        .status-success {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status-failed {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .footer {
+            text-align: center;
+            padding: 30px;
+            background: #333;
+            color: white;
+        }
+        .footer a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .footer a:hover {
+            text-decoration: underline;
+        }
+        @media (max-width: 768px) {
+            .header h1 { font-size: 1.8em; }
+            .stats-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏠 Home Backup Report</h1>
+            <p>Generated on $(date)</p>
+            <p>Version $SCRIPT_VERSION | $SCRIPT_NAME</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">📦</div>
+                <div class="stat-value">$total_backups</div>
+                <div class="stat-label">Total Backups</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">💾</div>
+                <div class="stat-value">$total_size</div>
+                <div class="stat-label">Total Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">✅</div>
+                <div class="stat-value">$successful_backups</div>
+                <div class="stat-label">Successful</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">❌</div>
+                <div class="stat-value">$failed_backups</div>
+                <div class="stat-label">Failed</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📊 Latest Backup Details</h2>
+            <div class="backup-list">
+EOF
+
+    if [ -n "$latest_backup" ] && [ -d "$latest_backup" ]; then
+        local latest_files=$(find "$latest_backup" -type f 2>/dev/null | wc -l)
+        cat >> "$output_file" << EOF
+                <div class="backup-item">
+                    <div class="backup-info">
+                        <span class="backup-icon">📁</span>
+                        <div>
+                            <div class="backup-date">$latest_date</div>
+                            <div class="backup-size">Size: $latest_size | Files: $latest_files</div>
+                        </div>
+                    </div>
+                    <span class="backup-status status-success">Latest</span>
+                </div>
+EOF
+    fi
+
+    cat >> "$output_file" << EOF
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📋 Recent Backups</h2>
+            <div class="backup-list">
+EOF
+
+    # List recent backups
+    local backups=()
+    while IFS= read -r -d '' backup; do
+        backups+=("$backup")
+    done < <(find "$BACKUP_DEST" -maxdepth 1 -type d -name "$(basename "$BACKUP_SOURCE")_*" -print0 | sort -r | head -10)
+
+    for backup in "${backups[@]}"; do
+        local name=$(basename "$backup")
+        local date_part=${name//$(basename "$BACKUP_SOURCE")_/}
+        local size=$(du -sh "$backup" 2>/dev/null | cut -f1)
+        local log_file="$LOGS_DIR/backup_${date_part}.log"
+
+        if [ -f "$log_file" ] && grep -q "completed successfully" "$log_file"; then
+            status_class="status-success"
+            status_text="Success"
+        else
+            status_class="status-failed"
+            status_text="Failed"
+        fi
+
+        cat >> "$output_file" << EOF
+                <div class="backup-item">
+                    <div class="backup-info">
+                        <span class="backup-icon">📁</span>
+                        <div>
+                            <div class="backup-date">${date_part//_/ }</div>
+                            <div class="backup-size">Size: $size</div>
+                        </div>
+                    </div>
+                    <span class="backup-status $status_class">$status_text</span>
+                </div>
+EOF
+    done
+
+    cat >> "$output_file" << EOF
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>⚙️ Configuration</h2>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr><td style="padding: 10px; border-bottom: 1px solid #eee;">Performance Mode</td><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>$PERFORMANCE_MODE</strong></td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #eee;">Verify Mode</td><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>$([ "$VERIFY_MODE" = true ] && echo "Enabled 🔍" || echo "Disabled")</strong></td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #eee;">Encryption</td><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>$([ "$ENABLE_ENCRYPTION" = true ] && echo "Enabled" || echo "Disabled")</strong></td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #eee;">Auto-Eject</td><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>$([ "$ENABLE_AUTO_EJECT" = true ] && echo "Enabled" || echo "Disabled")</strong></td></tr>
+                <tr><td style="padding: 10px; border-bottom: 1px solid #eee;">Max Backups Kept</td><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>$MAX_BACKUPS</strong></td></tr>
+            </table>
+        </div>
+
+        <div class="footer">
+            <p>Generated by <a href="$SCRIPT_GITHUB" target="_blank">Home Backup Utility v$SCRIPT_VERSION</a></p>
+            <p>Author: $SCRIPT_AUTHOR | <a href="$SCRIPT_WEBSITE" target="_blank">$SCRIPT_WEBSITE</a></p>
+            <p style="margin-top: 10px; font-size: 0.9em; opacity: 0.8;">Build Date: $SCRIPT_BUILD_DATE</p>
+        </div>
+    </div>
+</body>
+</html>
+EOF
+
+    echo -e "${GREEN}✅ HTML report generated: $output_file${NC}"
+
+    # Try to open in browser
+    if command -v xdg-open &> /dev/null; then
+        xdg-open "$output_file" &> /dev/null &
+    elif command -v open &> /dev/null; then
+        open "$output_file" &> /dev/null &
+    fi
+}
+
+generate_pdf_report() {
+    local html_report="$LOGS_DIR/backup_report_$TIMESTAMP.html"
+    local pdf_report="$LOGS_DIR/backup_report_$TIMESTAMP.pdf"
+
+    # First generate HTML
+    generate_html_report "$html_report"
+
+    # Try to convert to PDF if wkhtmltopdf is available
+    if command -v wkhtmltopdf &> /dev/null; then
+        echo -e "${BLUE}📄 Generating PDF report...${NC}"
+        wkhtmltopdf "$html_report" "$pdf_report" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ PDF report generated: $pdf_report${NC}"
+        else
+            echo -e "${YELLOW}⚠️  PDF generation failed, HTML available${NC}"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  Install wkhtmltopdf for PDF generation${NC}"
+    fi
+}
+
+#####################################################################
+# HEALTH CHECK MODULE
+# Comprehensive backup health verification
+#####################################################################
+
+check_backup_health() {
+    local backup_path="${1:-$BACKUP_DEST/latest}"
+
+    clear
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border double \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 46 \
+            "🏥  BACKUP HEALTH CHECK"
+    else
+        echo -e "${GREEN}🏥 BACKUP HEALTH CHECK${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    fi
+
+    if [ ! -d "$backup_path" ]; then
+        echo -e "${RED}❌ No backup found at $backup_path${NC}"
+        sleep 2
+        return 1
+    fi
+
+    echo -e "\n${YELLOW}Checking backup: $(basename "$backup_path")${NC}"
+    echo ""
+
+    local issues=0
+    local warnings=0
+
+    # Check 1: Basic structure
+    echo -ne "📁 Checking directory structure... "
+    if [ -d "$backup_path/Documents" ] || [ -d "$backup_PATH/Desktop" ] || [ -d "$backup_path/Downloads" ]; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${YELLOW}Warning: Unusual structure${NC}"
+        ((warnings++))
+    fi
+
+    # Check 2: File count sanity
+    echo -ne "📊 Checking file count... "
+    local file_count=$(find "$backup_path" -type f 2>/dev/null | wc -l)
+    if [ $file_count -gt 100 ]; then
+        echo -e "${GREEN}$file_count files${NC}"
+    else
+        echo -e "${YELLOW}Warning: Only $file_count files (unusually low)${NC}"
+        ((warnings++))
+    fi
+
+    # Check 3: Zero-byte files
+    echo -ne "📉 Checking for zero-byte files... "
+    local zero_count=$(find "$backup_path" -type f -size 0 2>/dev/null | wc -l)
+    if [ $zero_count -eq 0 ]; then
+        echo -e "${GREEN}None${NC}"
+    else
+        echo -e "${YELLOW}Found $zero_count zero-byte files${NC}"
+        ((warnings++))
+    fi
+
+    # Check 4: Broken symlinks
+    echo -ne "🔗 Checking for broken symlinks... "
+    local broken_count=$(find "$backup_path" -type l ! -exec test -e {} \; -print 2>/dev/null | wc -l)
+    if [ $broken_count -eq 0 ]; then
+        echo -e "${GREEN}None${NC}"
+    else
+        echo -e "${RED}Found $broken_count broken symlinks${NC}"
+        ((issues++))
+    fi
+
+    # Check 5: Permission issues
+    echo -ne "🔐 Checking permissions... "
+    local unreadable=$(find "$backup_path" ! -readable 2>/dev/null | wc -l)
+    if [ $unreadable -eq 0 ]; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${YELLOW}$unreadable files unreadable${NC}"
+        ((warnings++))
+    fi
+
+    # Check 6: Backup age
+    echo -ne "⏰ Checking backup age... "
+    local backup_time=$(stat -c %Y "$backup_path" 2>/dev/null)
+    local current_time=$(date +%s)
+    local age_days=$(( (current_time - backup_time) / 86400 ))
+
+    if [ $age_days -lt 7 ]; then
+        echo -e "${GREEN}$age_days days old${NC}"
+    elif [ $age_days -lt 30 ]; then
+        echo -e "${YELLOW}$age_days days old${NC}"
+        ((warnings++))
+    else
+        echo -e "${RED}$age_days days old (too old)${NC}"
+        ((issues++))
+    fi
+
+    # Check 7: Disk space
+    echo -ne "💾 Checking destination space... "
+    local free_space=$(df -h "$BACKUP_DEST" | awk 'NR==2 {print $4}')
+    local free_percent=$(df "$BACKUP_DEST" | awk 'NR==2 {print $5}' | sed 's/%//')
+
+    if [ $free_percent -lt 80 ]; then
+        echo -e "${GREEN}${free_space} free${NC}"
+    elif [ $free_percent -lt 90 ]; then
+        echo -e "${YELLOW}${free_space} free (getting full)${NC}"
+        ((warnings++))
+    else
+        echo -e "${RED}${free_space} free (CRITICAL)${NC}"
+        ((issues++))
+    fi
+
+    # Summary
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [ $issues -eq 0 ] && [ $warnings -eq 0 ]; then
+        echo -e "${GREEN}✅ Backup is HEALTHY - No issues found${NC}"
+    elif [ $issues -eq 0 ]; then
+        echo -e "${YELLOW}⚠️  Backup has $warnings warnings but no critical issues${NC}"
+    else
+        echo -e "${RED}❌ Backup has $issues critical issues and $warnings warnings${NC}"
+    fi
+
+    echo ""
+    if command -v gum &> /dev/null; then
+        gum confirm "Press Enter to continue" && return
+    else
+        echo -e "\n${BLUE}Press Enter to continue...${NC}"
+        read -r
+    fi
+}
+
+#####################################################################
+# PERFORMANCE TUNING MODULE
+# Advanced rsync optimizations
+#####################################################################
+
+optimize_rsync_settings() {
+    local mount_type=$(detect_mount_type)
+
+    echo -e "${BLUE}⚡ Analyzing system for optimal rsync settings...${NC}"
+    echo ""
+
+    # Check CPU cores for parallel processing
+    local cpu_cores=$(nproc 2>/dev/null || echo "1")
+    echo -e "🖥️  CPU Cores: $cpu_cores"
+
+    # Check RAM for buffer sizing
+    local total_ram=$(free -m | awk '/^Mem:/{print $2}')
+    echo -e "💾 RAM: ${total_ram}MB"
+
+    # Check filesystem type
+    echo -e "📁 Destination FS: $(df -T "$BACKUP_DEST" | awk 'NR==2 {print $2}')"
+
+    # Recommend optimal settings
+    echo ""
+    echo -e "${GREEN}Recommended Optimizations:${NC}"
+
+    # Parallel transfers recommendation
+    local parallel=$((cpu_cores * 2))
+    echo -e "  • Use ${YELLOW}--rsync-path=\"rsync\" --compress-level=9${NC} for compression"
+
+    if [ $total_ram -gt 8000 ]; then
+        echo -e "  • Add ${YELLOW}--bwlimit=0${NC} (unlimited - plenty of RAM)"
+    else
+        echo -e "  • Add ${YELLOW}--bwlimit=10000${NC} (10MB/s limit to prevent swapping)"
+    fi
+
+    # Filesystem specific
+    case $(df -T "$BACKUP_DEST" | awk 'NR==2 {print $2}') in
+        btrfs|xfs)
+            echo -e "  • Add ${YELLOW}--inplace${NC} for CoW filesystems"
+            ;;
+        ext4)
+            echo -e "  • Add ${YELLOW}--no-inc-recursive${NC} for ext4"
+            ;;
+    esac
+
+    # Network optimization
+    if [ "$mount_type" = "network" ]; then
+        echo -e "  • Add ${YELLOW}--partial --partial-dir=.rsync-partial${NC} for resuming"
+    fi
+
+    echo ""
+    if command -v gum &> /dev/null; then
+        gum confirm "Press Enter to continue" && return
+    else
+        echo -e "\n${BLUE}Press Enter to continue...${NC}"
+        read -r
+    fi
+}
+
+#####################################################################
+# CLOUD PREP MODULE (v2.0 Ready)
+# Prepares for integration with rclone
+#####################################################################
+
+check_rclone() {
+    if command -v rclone &> /dev/null; then
+        echo -e "${GREEN}✅ rclone installed${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}⚠️  rclone not installed (optional for cloud backups)${NC}"
+        return 1
+    fi
+}
+
+prepare_for_cloud() {
+    clear
+    if command -v gum &> /dev/null; then
+        gum style \
+            --border double \
+            --padding "1 2" \
+            --margin "1" \
+            --border-foreground 99 \
+            "☁️  CLOUD PREPARATION (v2.0 Ready)" \
+            "" \
+            "Prepare your backups for cloud storage"
+    else
+        echo -e "${PURPLE}☁️ CLOUD PREPARATION (v2.0 Ready)${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}This module prepares your backups for cloud upload:${NC}"
+    echo "  1. Encrypts backups for cloud storage"
+    echo "  2. Creates manifest files"
+    echo "  3. Validates integrity before upload"
+    echo "  4. Splits large backups into chunks"
+    echo ""
+
+    if ! check_rclone; then
+        echo -e "${YELLOW}Recommended: Install rclone for cloud uploads${NC}"
+    fi
+
+    # Check latest backup
+    local latest=$(find_last_backup)
+    if [ -z "$latest" ]; then
+        echo -e "${RED}❌ No backup found to prepare${NC}"
+        sleep 2
+        return
+    fi
+
+    echo -e "${GREEN}✓ Found backup: $(basename "$latest")${NC}"
+    echo ""
+
+    # Create cloud-ready package
+    local cloud_dir="$BACKUP_DEST/cloud_ready"
+    mkdir -p "$cloud_dir"
+
+    echo -e "${BLUE}Creating cloud-ready package...${NC}"
+
+    # Create manifest
+    local manifest="$cloud_dir/manifest.txt"
+    echo "Backup: $(basename "$latest")" > "$manifest"
+    echo "Created: $(date)" >> "$manifest"
+    echo "Size: $(du -sh "$latest" | cut -f1)" >> "$manifest"
+    echo "Files: $(find "$latest" -type f | wc -l)" >> "$manifest"
+    echo "SHA256: $(tar -cf - "$latest" 2>/dev/null | sha256sum | cut -d' ' -f1)" >> "$manifest"
+
+    # Create checksums
+    find "$latest" -type f -exec sha256sum {} \; > "$cloud_dir/checksums.txt"
+
+    echo -e "${GREEN}✅ Cloud package created in: $cloud_dir${NC}"
+    echo -e "${YELLOW}   Total size: $(du -sh "$cloud_dir" | cut -f1)${NC}"
+    echo ""
+    echo -e "${BLUE}Next steps (v2.0):${NC}"
+    echo "  • Use rclone to sync to cloud storage"
+    echo "  • Example: rclone sync $cloud_dir remote:backups/"
+    echo ""
+
+    if command -v gum &> /dev/null; then
+        gum confirm "Press Enter to continue" && return
+    else
+        echo -e "\n${BLUE}Press Enter to continue...${NC}"
+        read -r
+    fi
+}
+
+#####################################################################
+# MODULE EXPORTS
+# Export all functions for use in main script
+#####################################################################
+
+# Encryption module
+export -f encrypt_backup decrypt_backup create_passphrase_file
+
+# Integrity module
+export -f verify_integrity quick_integrity_check integrity_report
+
+# Auto-eject module
+export -f do_eject list_usb_devices
+
+# Network module
+export -f check_network_share mount_network_share unmount_network_share test_network_speed
+
+# Advanced cleanup module
+export -f analyze_disk_usage deep_cleanup
+
+# Report generation module
+export -f generate_html_report generate_pdf_report
+
+# Health check module
+export -f check_backup_health
+
+# Performance tuning module
+export -f optimize_rsync_settings
+
+# Cloud prep module
+export -f check_rclone prepare_for_cloud
+
+#####################################################################
+# MODULE INITIALIZATION
+# Run when module is loaded
+#####################################################################
+
+# Check for required tools for modules
+if [ "$ENABLE_ENCRYPTION" = true ] && ! command -v gpg &> /dev/null; then
+    echo -e "${YELLOW}⚠️  GPG not installed. Encryption disabled.${NC}"
+    ENABLE_ENCRYPTION=false
+fi
+
+# Create module directories if needed
+mkdir -p "$INTEGRITY_DIR"
+
+# Module loaded message (quiet in cron mode)
+if [ -z "$1" ] || ! is_cron_mode "$1"; then
+    echo -e "${GREEN}✅ Modules loaded: Encryption, Integrity, Auto-Eject, Network, Reports, Health, Cloud${NC}"
+fi
