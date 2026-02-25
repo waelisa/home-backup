@@ -83,4 +83,4 @@ This project is licensed under the MIT License. Use it, change it, share it.
 
 ## ☕ Support the Project
 
-[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.me/YOUR_PAYPAL_USERNAME)
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)]([(https://www.paypal.me/WaelIsa))
